@@ -1,0 +1,31 @@
+name: full_env
+channels:
+  - conda-forge
+dependencies:
+  - python
+  - numpy
+  - pandas
+  - xarray
+  - rioxarray
+  - cdsapi
+  - eccodes
+  - cartopy
+  - geopandas
+  - joblib
+  - bottleneck
+  - pip
+  - scipy
+  - scikit-learn
+  - netcdf4
+  - cfgrib
+  - dask
+  - hdf4
+  - hdf5
+  - matplotlib
+  - h5netcdf
+  - h5py
+  - seaborn
+  - optuna
+  - shap
+  - pip:
+      - xgboost
