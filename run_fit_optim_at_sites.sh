@@ -1,12 +1,12 @@
 #!/bin/sh -l
-#SBATCH --job-name=resiclim
+#SBATCH --job-name=resiclim_4
 #SBATCH --time=72:00:00 
 #SBATCH --partition=compute
-#SBATCH -N 21
-#SBATCH -n 21
+#SBATCH -N 14
+#SBATCH -n 14
 #SBATCH -c 128  
 #SBATCH --mem=240G
-#SBATCH -o fit_resic.out
+#SBATCH -o fit_resic_14.out
 
 
 
@@ -17,6 +17,14 @@
 #export PATH="/lustre/tmp/kamarain/miniconda/bin:$PATH"
 source /lustre/tmp/kamarain/miniconda/etc/profile.d/conda.sh
 conda activate full_env
+
+
+
+# Prepare data 
+#srun -n1 -N1 -c128 --exclusive python process_logger_sample.py
+
+srun -n1 -N1 -c128 --exclusive python process_dem_to_sites.py
+
 
 
 declare -a years=("2019" "2020" "2021" "2022" "2023" "2024" "2025")
@@ -32,16 +40,16 @@ count=0
 for year in "${years[@]}"; do
     for region in "${regions[@]}"; do
         echo "Processing region: $region, year: $year"
-        srun -n1 -N1 -c128 --exclusive python fit_optim_at_sites.py $region $year $optimize $fit &
+        #srun -n1 -N1 -c128 --exclusive python fit_optim_at_sites.py $region $year $optimize $fit &
         
         count=$((count + 1))
-        if (( count % 21 == 0 )); then
+        if (( count % 14 == 0 )); then
             wait
-            echo "Batch of 21 jobs completed."
+            echo "Batch of jobs completed."
         fi
     done
 done
-
+wait
 
 # Do not optimize, but fit, do not predit
 optimize="False"
@@ -54,13 +62,13 @@ for year in "${years[@]}"; do
         srun -n1 -N1 -c128 --exclusive python fit_optim_at_sites.py $region $year $optimize $fit &
         
         count=$((count + 1))
-        if (( count % 21 == 0 )); then
+        if (( count % 14 == 0 )); then
             wait
-            echo "Batch of 21 jobs completed."
+            echo "Batch of jobs completed."
         fi
     done
 done
-
+wait
 
 
 # Do not optimize, do not fit, but predit
@@ -74,9 +82,17 @@ for year in "${years[@]}"; do
         srun -n1 -N1 -c128 --exclusive python fit_optim_at_sites.py $region $year $optimize $fit &
         
         count=$((count + 1))
-        if (( count % 21 == 0 )); then
+        if (( count % 14 == 0 )); then
             wait
-            echo "Batch of 21 jobs completed."
+            echo "Batch of jobs completed."
         fi
     done
 done
+wait
+
+
+# Analysis of the output
+srun -n1 -N1 -c128 --exclusive python analyse_results_at_sites.py
+
+
+

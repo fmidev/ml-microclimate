@@ -8,7 +8,7 @@ import xarray as xr
 
 import geopandas as gpd
 
-import matplotlib.pyplot as plt
+
 
 
 
@@ -25,6 +25,9 @@ era5_dir='/lustre/tmp/kamarain/ERA5_NFin/'
 
 
 
+version = '15-10-2025'
+
+plot = True
 
 
 
@@ -37,15 +40,15 @@ fcts=importlib.reload(fcts)
 
 
 # Metadata
-era5_vars, help_vars, lags, regions = fcts.get_metadata()
+era5_vars, help_vars, accumulations, lags, regions = fcts.get_metadata()
 
 
 # Logger coordinates
-smp_coords = pd.read_csv(rslt_dir+f'logger_locations_sample_22-09-2025.csv', index_col=False)
+smp_coords = pd.read_csv(rslt_dir+f'logger_locations_sample_{version}.csv', index_col=False)
 all_coords = gpd.read_file(f'{code_dir}site_coordinates_all.gpkg').rename(columns={'X_tm35fin':'X', 'Y_tm35fin':'Y'})
 
 # Logger data
-logger_data = pd.read_csv(rslt_dir+'logger_data_selected_22-09-2025.csv', index_col=False, parse_dates=['time'])
+logger_data = pd.read_csv(rslt_dir+f'logger_data_selected_{version}.csv', index_col=False, parse_dates=['time'])
 
 # Extract the coordinate data of the sites in different regions
 site_points = logger_data.groupby('site').mean(numeric_only=True)[['x','y','lon','lat']]
@@ -66,15 +69,18 @@ import matplotlib.font_manager as fm
 fontprops = fm.FontProperties(size=12)
 
 # Read preprocessed DEM data from netcdf files
-plot = True
 
-if plot: f, axes = plt.subplots(2,3, figsize=(12,7),)
+
+if plot: 
+    import matplotlib; matplotlib.use('agg')
+    import matplotlib.pyplot as plt
+    f, axes = plt.subplots(2,3, figsize=(12,7),)
 
 dem_data = []
 for i,region in enumerate(regions):
     print('\nDEM for',region)
     #ds_dem = fcts.read_dem(fs, region)
-    ds_dem = fcts.read_dem('/lustre/tmp/kamarain/resiclim-microclimate', region).drop('spatial_ref')
+    ds_dem = fcts.read_dem('/lustre/tmp/kamarain/resiclim-microclimate', region)#.drop('spatial_ref')
     
     region_idx = logger_data['region'] == region
     x_min = logger_data.loc[region_idx, 'x'].min() - 500
@@ -145,6 +151,7 @@ if plot:
 
 
 
+
 dem_ds = xr.merge(dem_data)
 
 # Interpolate DEM data to measurement sites
@@ -158,6 +165,121 @@ dem_ds_interp = dem_ds_interp.assign_coords({'time': interp_points['time'],
 #dem_data_df = dem_ds_interp.to_dataframe().reset_index().drop(columns=['x','y','points'])
 dem_data_df = dem_ds_interp.to_dataframe().reset_index().drop(columns=['points'])
 
-dem_data_df.to_csv(rslt_dir+'dem_data_selected_22-09-2025.csv', index=False)
 
+# Collect PISR data to one temporal column
+
+# Ensure time is datetime
+if not pd.api.types.is_datetime64_any_dtype(dem_data_df['time']):
+    dem_data_df['time'] = pd.to_datetime(dem_data_df['time'])
+
+# Create the target column
+dem_data_df['St_pisr'] = pd.NA
+
+# Fill per month (no big arrays, memory-safe)
+for m in range(1, 13):
+    col = f'St_pisr_{m}'
+    if col in dem_data_df.columns:
+        mask = dem_data_df['time'].dt.month.eq(m)
+        dem_data_df.loc[mask, 'St_pisr'] = dem_data_df.loc[mask, col]
+
+# Drop the original monthly columns that exist
+pisr_cols = [c for c in dem_data_df.columns if c.startswith('St_pisr_')]
+dem_data_df = dem_data_df.drop(columns=pisr_cols)
+
+"""
+dem_data_df[['time','St_pisr']].groupby('time').mean().plot(); plt.savefig('fig_pisr_time.png')
+dem_data_df[['site','St_pisr']].groupby('site').mean().plot(); plt.savefig('fig_pisr_site.png')
+"""
+
+
+dem_data_df.to_csv(rslt_dir+f'dem_data_selected_{version}.csv', index=False)
+
+
+
+
+
+
+if plot:
+    
+    # Correlation matrix
+    df = dem_data_df.drop(columns=['x','y','time','site'])#.dropna()
+    sorted_cols = np.sort(df.columns)
+    corr = df[sorted_cols].corr().round(2)
+    
+    
+    import seaborn as sns
+    fig = plt.figure(figsize=(25,20)) #(35, 30))
+    
+    sns.heatmap(corr, annot=True, cmap='coolwarm',
+                xticklabels=corr.columns.values,
+                yticklabels=corr.columns.values)
+    plt.title('Correlation Matrix', fontsize=16); plt.tight_layout()
+    fig.savefig(rslt_dir+f'fig_staticfeatures_correlationmatrix_{version}.png')
+    fig.savefig(rslt_dir+f'fig_staticfeatures_correlationmatrix_{version}.pdf')
+    plt.clf(); plt.close('all')
+    
+    
+    
+    import matplotlib.patheffects as pe
+    
+    for i,region in enumerate(regions):
+        ds_dem = dem_data[i]
+        
+        # Combine all variables into a DataArray where True = not NaN
+        valid_mask = xr.concat([~ds_dem[var].isnull() for var in ds_dem.data_vars], dim="vars")
+        
+        # Reduce across the new 'vars' dimension — keep only where all variables are valid
+        all_valid = valid_mask.all(dim="vars")
+        
+        # Create final mask: 1 where valid, NaN where at least one is NaN
+        nan_mask = xr.where(all_valid, 1, np.nan)
+        ds_mask = nan_mask.interp_like(ds_dem)
+        
+        ds_dem_masked = ds_dem*ds_mask
+        ds_dem_masked = ds_dem_masked.dropna('y',how='all').dropna('x',how='all')
+        
+        # Choose grid shape: (rows, cols)
+        rows, cols = 5, 6
+
+        # Only variables with 2D (y, x)
+        vars2d = [v for v in ds_dem_masked.data_vars if (set(ds_dem_masked[v].dims) == {"y","x"} and not "pisr" in v)]
+
+        total = rows * cols
+        if len(vars2d) > total: print(f"Note: showing first {total} of {len(vars2d)} variables.")
+        
+        vars2d = sorted(vars2d[:total])
+
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.8, rows * 1.8), squeeze=False)
+
+        i = 0
+        for r in range(rows):
+            for c in range(cols):
+                ax = axes[r, c]
+                ax.set_axis_off()
+                if i < len(vars2d):
+                    v = vars2d[i]
+                    da = ds_dem_masked[v]
+                    da.plot(ax=ax, cmap="jet", robust=True, add_colorbar=False)
+
+                    # Build short, bold label
+                    label = v.replace("St_", "").upper()
+
+                    # Text box in axes coords (top-left), with white background
+                    ax.text(
+                        0.01, 0.99, label,
+                        transform=ax.transAxes,
+                        va="top", ha="left",
+                        fontsize=8, fontweight="bold",
+                        bbox=dict(facecolor="white", edgecolor="none", alpha=1, boxstyle="round,pad=0.2"),
+                        path_effects=[pe.withStroke(linewidth=1.0, foreground="black", alpha=0.25)]
+                    )
+                    i += 1
+
+        # Tight layout, minimal gaps
+        plt.subplots_adjust(left=0.005, right=0.995, bottom=0.005, top=0.995, wspace=0.005, hspace=0.005)
+
+        # Save/show
+        # fig.savefig(rslt_dir+f'fig_static_features_{region}.pdf')
+        fig.savefig(rslt_dir+f'fig_static_features_{region}_{version}.png', dpi=200)
+        plt.show(); plt.clf(); plt.close('all')
 

@@ -1,5 +1,13 @@
 
 
+"""
+TUTKI T1 TULOKSIA, ONKO VIIMEISIN VERSIO PAREMPI KUIN EDELLINEN _ 
+
+KARSI ERA5 JA MUITA MUUTTUJIA
+
+
+"""
+
 # Read modules
 import sys, ast, importlib, datetime, itertools, os, random, glob, joblib, pickle
 import numpy as np
@@ -32,7 +40,7 @@ optimize    = False
 
 
 
-
+fit         = True
 
 
 
@@ -56,7 +64,7 @@ era5_dir='/lustre/tmp/kamarain/ERA5_NFin/'
 
 
 
-
+version = '15-10-2025'
 
 
 
@@ -68,16 +76,16 @@ fcts=importlib.reload(fcts)
 
 
 # Metadata
-era5_vars, help_vars, lags, regions = fcts.get_metadata()
+era5_vars, help_vars, accumulations, lags, regions = fcts.get_metadata()
 
 
 # Logger coordinates
-coords = pd.read_csv(rslt_dir+f'logger_locations_sample_22-09-2025.csv', index_col=False)
+coords = pd.read_csv(rslt_dir+f'logger_locations_sample_{version}.csv', index_col=False)
 
 
 
 # Logger data
-logger_data = pd.read_csv(rslt_dir+'logger_data_selected_22-09-2025.csv', index_col=False, parse_dates=['time'])
+logger_data = pd.read_csv(rslt_dir+f'logger_data_selected_{version}.csv', index_col=False, parse_dates=['time'])
 #logger_data = logger_data.loc[logger_data['error_tomst']==0]
 
 # Extract the coordinate data of the sites in different regions
@@ -168,7 +176,7 @@ dem_data_df.to_csv(rslt_dir+'dem_data_selected.csv', index=False)
 
 #dem_data_df = pd.read_csv(rslt_dir+'dem_data_all.csv', index_col=False)
 
-dem_data_df = pd.read_csv(rslt_dir+'dem_data_selected_22-09-2025.csv', index_col=False)
+dem_data_df = pd.read_csv(rslt_dir+f'dem_data_selected_{version}.csv', index_col=False)
 
 
 
@@ -177,20 +185,82 @@ fcts.print_ram_state()
 
 
 
-# Read ERA5 predictor data for the Northern Finland
+# Read ERA5 predictor data for the Northern Finland and Fennoscandia
 lat_range, lon_range = [62, 72], [19, 32]
-era5_data = fcts.read_era5(era5_dir, era5_vars, help_vars, lat_range, lon_range, 
-                           lags, pd.date_range('2019-01-01','2025-08-31',freq='1h'))
-
-era5_static = xr.open_dataset(era5_dir+'era5_static_surface_variables.nc')
-era5_static = fcts.adjust_lats_lons(era5_static).sel(lat=slice(lat_range[0], lat_range[1]), lon=slice(lon_range[0], lon_range[1]))
-era5_static = era5_static.drop(['valid_time','number','expver']).squeeze()
-for v in era5_static.data_vars:
-    era5_static = era5_static.rename({v: 'E5_'+v+'_static'})
+era5_data = fcts.read_era5(era5_dir, lat_range, lon_range, lags, pd.date_range('2019-01-01','2025-08-31',freq='1h'))
 
 
-era5_data =  xr.merge([era5_data, era5_static])
-#    ds_era5_static = xr.open_dataset(f'{file_path}/era5_static_surface_variables.nc').load() 
+
+
+
+
+# Correlation matrix
+plot_vrbs = []
+for v in era5_data.data_vars:
+    if '000' in v or 'E5stat' in v: plot_vrbs.append(v)
+
+
+df = era5_data[plot_vrbs].load().stack(datapoint=['time','lat','lon']).to_dataframe().drop(columns=['time','lat','lon']).dropna()
+sorted_cols = np.sort(df.columns)
+corr = df[sorted_cols].corr().round(2)
+
+
+import seaborn as sns
+fig = plt.figure(figsize=(15, 10))
+
+sns.heatmap(corr, annot=True, cmap='coolwarm',
+            xticklabels=corr.columns.values,
+            yticklabels=corr.columns.values)
+plt.title('Correlation Matrix', fontsize=16); plt.tight_layout()
+fig.savefig(rslt_dir+f'fig_era5features_correlationmatrix_{version}.png')
+fig.savefig(rslt_dir+f'fig_era5features_correlationmatrix_{version}.pdf')
+plt.clf(); plt.close('all')
+
+
+"""
+df_tmean = df.groupby('time').mean()
+
+
+
+
+df_tmean[['E5dyna_dt2d2m_+000','E5dyna_dt2skt_+000']].plot()
+plt.legend(); plt.show()
+
+
+plot_vrbs = ['E5dyna_avg_sdlwrf_+000', 'E5dyna_avg_snlwrf_+000', 'E5dyna_fdir_+000', 
+             'E5dyna_ssrd_+000','E5dyna_avg_sdswrf_+000','E5dyna_emis_+000', 
+             'E5dyna_uwlr_+000', 'E5dyna_difr_+000']
+
+df_tmean[plot_vrbs].plot()
+plt.legend(); plt.show()
+
+
+
+plot_vrbs = ['E5dyna_avg_sdlwrf_+000', 'E5dyna_avg_snlwrf_+000','E5dyna_avg_sdswrf_+000']
+df_tmean[plot_vrbs].plot()
+plt.legend(); plt.show()
+
+plot_vrbs = ['E5dyna_emis_+000', 'E5dyna_uwlr_+000', 'E5dyna_difr_+000']
+df_tmean[plot_vrbs].plot()
+plt.legend(); plt.show()
+
+
+plot_vrbs = ['E5dyna_fdir_+000','E5dyna_ssrd_+000',]
+df_tmean[plot_vrbs].plot()
+plt.legend(); plt.show()
+
+
+
+
+
+plot_vrbs = ['E5dyna_avg_sdswrf_+000','E5dyna_ssrd_+000',]
+(df_tmean['E5dyna_avg_sdswrf_+000']*4e3).plot()
+(df_tmean['E5dyna_ssrd_+000']*1).plot()
+plt.legend(); plt.show()
+"""
+
+
+
 
 fcts.print_ram_state()
 
@@ -215,7 +285,12 @@ era5_data_interpolated = era5_data.interp(
 
 
 # Convert interpolated xarray Dataset to DataFrame
-era5_data_interpolated_df = era5_data_interpolated.to_dataframe().reset_index().drop(columns=['points','number','time','lat','lon'])
+era5_data_interpolated_df = era5_data_interpolated.to_dataframe().reset_index()
+
+drops = ['points','number','time','lat','lon']
+for col in era5_data_interpolated_df:
+    if col in drops:
+        era5_data_interpolated_df = era5_data_interpolated_df.drop(columns=col)
 
 
 # Define temporal cycle predictors
@@ -232,6 +307,9 @@ all_data = pd.concat([  logger_data.reset_index(drop=True),
 
 
 
+fcts.print_ram_state()
+
+
 
 
 # Names of different variables
@@ -240,10 +318,12 @@ sptial_variables = ['lat','lon','y','x','region','site'] # ['lat','lon','y','x',
 reanal_variables = list(era5_data_interpolated_df.columns)
 static_variables = list(dem_data_df.drop(columns=['x','y','time','site']).columns)
 cyclic_variables = list(cyclical_df.columns)
-era5_variables = ['E5_t2m_degC', 'E5_skt_degC']
+#era5_variables = ['E5dyna_t2m_degC', 'E5dyna_skt_degC']
+era5_variables = ['E5dyna_skt_degC']
 
-all_data['E5_t2m_degC'] = all_data['E5_t2m_+000'] - 273.15
-all_data['E5_skt_degC'] = all_data['E5_skt_+000'] - 273.15
+
+#all_data['E5dyna_t2m_degC'] = all_data['E5dyna_t2m_+000'] - 273.15
+all_data['E5dyna_skt_degC'] = all_data['E5dyna_skt_+000'] - 273.15
 
 
 
@@ -251,7 +331,7 @@ all_data['E5_skt_degC'] = all_data['E5_skt_+000'] - 273.15
 offset_variables = []
 for v in target_variables:
     offset_variable = v+'_offset'
-    all_data[offset_variable] = all_data[v] - all_data['E5_skt_degC'] #(all_data['E5_t2m_+000'] - 273.15)
+    all_data[offset_variable] = all_data[v] - all_data['E5dyna_skt_degC'] #(all_data['E5_t2m_+000'] - 273.15)
     offset_variables.append(offset_variable)
 
 
@@ -340,6 +420,10 @@ print('Train:', trn_regions, trn_idx.sum(), X_trn.shape, trn_years)
 print('Valid:', val_regions, val_idx.sum(), X_val.shape, val_years)
 print('\n')
 
+fcts.print_ram_state()
+
+
+
 
 
 fcts=importlib.reload(fcts)
@@ -386,7 +470,7 @@ if not optimize:
 
 if fit:
     
-    # No early stopping 
+    # No early stopping, using it would require using validation data which is not allowed
     fitted_ensemble = fcts.fit_ensemble(
         X_trn.drop(columns='time'), Y_trn,
         X_val.drop(columns='time'), Y_val,
@@ -395,9 +479,16 @@ if fit:
     model_file = rslt_dir+f'model_{region}_{val_year}.pkl'
     joblib.dump(fitted_ensemble, model_file)
     
+    fcts.print_ram_state('after XGBoost fit')
+    
     # LASSO reference model
     params_lasso = fcts.params_lasso()
-    bagging_ens = fcts.bagging_model(X_trn.drop(columns='time'), Y_trn, params_lasso)
+    
+    #bagging_ens = fcts.bagging_model_MTLasso(X_trn.drop(columns='time'), Y_trn, params_lasso)
+    #fcts.print_ram_state('after MTLasso fit')
+    
+    bagging_ens = fcts.bagging_model_LassoLars(X_trn.drop(columns='time'), Y_trn, params_lasso)
+    fcts.print_ram_state('after LassoLars fit')
     
     model_file = rslt_dir+f'lasso_{region}_{val_year}.pkl'
     joblib.dump(bagging_ens, model_file)
@@ -415,7 +506,7 @@ if not fit:
 
 # Save the forecast
 Y.loc[val_idx,xgboost_variables] = fitted_ensemble.predict(X_val.drop(columns='time'))
-Y.loc[val_idx,lasso_variables]   = bagging_ens.predict(X_val.drop(columns='time').ffill().bfill().fillna(0))
+Y.loc[val_idx,lasso_variables]   = fcts.predict_bagging(bagging_ens, X_val.drop(columns='time'))
 
 
 
@@ -427,10 +518,8 @@ Y_val = Y.loc[val_idx]
 
 # Back to original variables from offsets
 for vt,vo in zip(target_variables,offset_variables):
-    #y['predicted_'+vt] = y['predicted_'+vo] + (all_data.loc[val_idx,'E5_t2m_degC'] - 273.15)
-    #y['predicted_'+vt] = y['predicted_'+vo] + all_data.loc[val_idx,'E5_skt_degC']
-    Y_val['xgboost_'+vt] = Y_val['xgboost_'+vo] + all_data.loc[val_idx,'E5_skt_degC']
-    Y_val['lasso_'+vt] = Y_val['lasso_'+vo] + all_data.loc[val_idx,'E5_skt_degC']
+    Y_val['xgboost_'+vt] = Y_val['xgboost_'+vo] + all_data.loc[val_idx,'E5dyna_skt_degC']
+    Y_val['lasso_'+vt]   = Y_val['lasso_'+vo]   + all_data.loc[val_idx,'E5dyna_skt_degC']
 
 
 # Save data
@@ -600,55 +689,55 @@ for key in mean_scores:
 
 
 
+plot_partialdependence = False
+if plot_partialdependence:
+    import math
+    import matplotlib.pyplot as plt
+    from sklearn.inspection import PartialDependenceDisplay
 
 
-import math
-import matplotlib.pyplot as plt
-from sklearn.inspection import PartialDependenceDisplay
+    #X_no_time_val = X_val.drop(columns='time')
+    #X_no_time_trn = X_trn.drop(columns='time')
+
+    target_idx = 2  # <- choose which output to plot
 
 
-#X_no_time_val = X_val.drop(columns='time')
-#X_no_time_trn = X_trn.drop(columns='time')
+    features_E5 = [v for v in X_shap.columns if ('E5stat' in v or ('E5dyna' in v and '+000' in v))]
+    features_ST = [v for v in X_shap.columns if ('St_' in v or 'E5stat' in v or v=='lat' or v=='lon')]
+    features_CY = [v for v in X_shap.columns if ('Cycle' in v)]# and not 'years' in v)]
 
-target_idx = 2  # <- choose which output to plot
+    names = ['ERA5', 'STATIC', 'CYCLES']
 
+    for name, features in zip(names, [features_E5, features_ST, features_CY]):
 
-features_E5 = [v for v in X_shap.columns if ('E5' in v and '+000' in v)]
-features_ST = [v for v in X_shap.columns if ('St_' in v or '_static' in v or v=='lat' or v=='lon')]
-features_CY = [v for v in X_shap.columns if ('Cycle' in v)]# and not 'years' in v)]
+        ncols = math.ceil(np.sqrt(len(features)))
+        nrows = math.ceil(len(features) / ncols)
+        
+        print(ncols,nrows,name,features)
+        
+        f, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3.5*nrows), squeeze=False)
 
-names = ['ERA5', 'STATIC', 'CYCLES']
+        for i, v in enumerate(features):
+            print(v)
+            ax_i = axes.flat[i]
+            PartialDependenceDisplay.from_estimator(
+                mdl,
+                X_shap,
+                [v],
+                kind='average',
+                grid_resolution=50,
+                target=target_idx,     # <-- key line
+                subsample=500000,
+                ax=ax_i
+            )
+            ax_i.set_title(v)
 
-for name, features in zip(names, [features_E5, features_ST, features_CY]):
+        for j in range(len(features), nrows*ncols):
+            axes.flat[j].set_visible(False)
 
-    ncols = math.ceil(np.sqrt(len(features)))
-    nrows = math.ceil(len(features) / ncols)
-    
-    print(ncols,nrows,name,features)
-    
-    f, axes = plt.subplots(nrows, ncols, figsize=(4*ncols, 3.5*nrows), squeeze=False)
-
-    for i, v in enumerate(features):
-        print(v)
-        ax_i = axes.flat[i]
-        PartialDependenceDisplay.from_estimator(
-            mdl,
-            X_shap,
-            [v],
-            kind='average',
-            grid_resolution=50,
-            target=target_idx,     # <-- key line
-            #subsample=500000,
-            ax=ax_i
-        )
-        ax_i.set_title(v)
-
-    for j in range(len(features), nrows*ncols):
-        axes.flat[j].set_visible(False)
-
-    plt.tight_layout()
-    f.savefig(rslt_dir + f'fig_PDP_{name}_{region}_{val_year}.png', dpi=200)
-    plt.clf(); plt.close('all')
+        plt.tight_layout()
+        f.savefig(rslt_dir + f'fig_PDP_{name}_{region}_{val_year}.png', dpi=200)
+        plt.clf(); plt.close('all')
 
 
 

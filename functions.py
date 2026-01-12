@@ -903,36 +903,6 @@ def generate_hourly_timerange(year, month):
 
 
 
-def get_metadata():
-
-    # Predictor variables
-    era5_vars = [   '2m_temperature',
-                    '2m_dewpoint_temperature',
-                    'mean_surface_downward_long_wave_radiation_flux',
-                    'mean_surface_net_long_wave_radiation_flux',
-                    '10m_u_component_of_wind',
-                    '10m_v_component_of_wind',
-                    'total_sky_direct_solar_radiation_at_surface',
-                    'surface_solar_radiation_downwards',
-                    'skin_temperature',
-                    'snow_depth',
-                    'mean_evaporation_rate',] 
-
-    help_vars = [   'd2m',
-                    'ssrd',
-                    'fdir']
-
-
-    # Lags (time steps) to be used for lagging the predictor data
-    lags = [-3,0,3,12,24,48]
-    lags = [-3,0,3,6]
-
-
-    regions = ['RAS', 'TII', 'KIL', 'PAL', 'ULV', 'VAR']
-
-    return era5_vars, help_vars, lags, regions
-
-
 def read_all_dem_data(fs, regions, plot_examples=False, site_points=[], rslt_dir=''):
     # Read preprocessed DEM data from netcdf files
     dem_data = []
@@ -972,96 +942,204 @@ def read_all_dem_data(fs, regions, plot_examples=False, site_points=[], rslt_dir
 
 
 
-def read_era5(era5_dir, era5_vars, help_vars, lats, lons, lags, other_time):
+
+
+def get_metadata():
+
+    # Predictor variables
+    era5_vars = [   '2m_temperature',
+                    '2m_dewpoint_temperature',
+                    'mean_surface_downward_long_wave_radiation_flux',
+                    'mean_surface_net_long_wave_radiation_flux',
+                    '10m_u_component_of_wind',
+                    '10m_v_component_of_wind',
+                    'total_sky_direct_solar_radiation_at_surface', # ssrd ACC
+                    'surface_solar_radiation_downwards', # ssrd ACC
+                    'skin_temperature',
+                    'snow_depth',
+                    #'mean_evaporation_rate',
+                    
+                    'mean_surface_downward_short_wave_radiation_flux',
+                    
+                    'mean_surface_latent_heat_flux',
+                    'mean_surface_sensible_heat_flux',
+                    
+                    #'mean_sea_level_pressure',
+                    'volumetric_soil_water_layer_1',
+                    'soil_temperature_level_1',
+                    
+                    #'lsm',
+                    #'cl',
+                    #'z',
+                    #'slt',
+                    'cvl',
+                    'cvh',
+                    #'tvl',
+                    #'tvh',
+                    'anor',
+                    'isor',
+                    #'slor',
+                    #'sdfor',
+                    'sdor'
+                    ] 
+
+    help_vars = [   'd2m','t2m','stl1',
+                    'ssrd',
+                    'fdir'
+                ]
     
+    accumulations = ['fdir', 
+                     'ssrd'
+                    ]
+
+    # Lags (time steps) to be used for lagging the predictor data
+    lags = [-3,0,3,12,24,48]
+    lags = [-3,0,3,6]
+    lags = [-6,0,6]
+    lags = [-6,-3,0,3,6]
     
-    era5_data = []
+    regions = ['RAS', 'TII', 'KIL', 'PAL', 'ULV', 'VAR']
+
+    return era5_vars, help_vars, accumulations, lags, regions
+
+
+
+def read_era5(era5_dir, lats, lons, lags, other_time):
+    import glob
+    
+    era5_vars, help_vars, accumulations, _, _ = get_metadata()
+    
+    # Read ERA5 dynamic variables
+    print('Reading ERA5 dynamic')
+    era5_ds_list = []
     for v in era5_vars:
+        #try:
+        vrb_files = glob.glob(era5_dir+v+'*.nc')
         
-        try:
-            era5_ds = adjust_lats_lons(xr.open_mfdataset(era5_dir+v+'*.nc')).sel(
+        #print(v,vrb_files)
+        if len(vrb_files) > 0:
+            
+            ds_era5 = adjust_lats_lons(xr.open_mfdataset(vrb_files)).sel(
                             lat=slice(lats[0], lats[1]),
-                            lon=slice(lons[0], lons[1]),).copy(deep=True)
+                            lon=slice(lons[0], lons[1]),)#.copy(deep=True)
             
-            era5_ds = era5_ds.rename({'valid_time':'time'})
+            ds_era5 = ds_era5.rename({'valid_time':'time'})
+            #print(ds_era5)
+            timesteps = np.intersect1d(other_time, ds_era5.time)
+            ds_era5 = ds_era5.sel(time=timesteps)
             
-            timesteps = np.intersect1d(other_time, era5_ds.time)
-            era5_ds = era5_ds.sel(time=timesteps)
+            data_var = list(ds_era5.data_vars)[0]
+            if 'expver' in list(ds_era5.coords):
+                #ds_era5 = ds_era5.sel(expver=1)
+                ds_era5 = ds_era5.drop('expver')
             
-            data_var = list(era5_ds.data_vars)[0]
-            if 'expver' in list(era5_ds.coords):
-                #era5_ds = era5_ds.sel(expver=1)
-                era5_ds = era5_ds.drop('expver')
+            if v in accumulations:
+                ds_era5 = np.diff(ds_era5, axis=0, append=np.nan)
+                ds_era5 = ds_era5[v].ffill('time')
             
-            #spatial_mean = era5_ds[data_var].mean(['lat','lon'])
-            #era5_ds[data_var][:] = np.nan 
-            #era5_ds[data_var][:] = era5_ds[data_var].fillna(spatial_mean)
-            
-            era5_data.append(era5_ds)
+            era5_ds_list.append(ds_era5)
             print('ERA5',v,data_var,'was read', flush=True)
-        except:
-            print('ERA5',v,'FAILED', flush=True)
+
     
     print_ram_state()
     
-    grid_data = xr.merge(era5_data)
+    era5_dynamic = xr.merge(era5_ds_list)
     
+    drop_coords = ['valid_time','expver','number']
+    for v in drop_coords:
+        if v in era5_dynamic.coords:
+            era5_dynamic = era5_dynamic.drop(v).squeeze()
     
-    if 'expver' in grid_data.coords:
-        grid_data = grid_data.drop('expver')
-    
+    print('Calculating ERA5 derived quantities')
     
     # Derive additional predictors based on
     # https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/2041-210X.13877
     
     # Spesific humidity
-    #grid_data['q'] = xr.full_like(grid_data['t2m'], np.nan)
-    #grid_data['q'][:] = calc_q1(grid_data['sp']/100., grid_data['d2m']-273.15)
+    #era5_dynamic['q'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    #era5_dynamic['q'][:] = calc_q1(era5_dynamic['sp']/100., era5_dynamic['d2m']-273.15)
     
-    
-    # Relative humidity
-    grid_data['rh'] = xr.full_like(grid_data['t2m'], np.nan)
-    grid_data['rh'][:] = calc_rh1(grid_data['t2m']-273.15, grid_data['d2m']-273.15)
-    
+    # Relative humidity !!
+    #era5_dynamic['rh'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    #era5_dynamic['rh'][:] = calc_rh1(era5_dynamic['t2m']-273.15, era5_dynamic['d2m']-273.15)
     
     # Emissivity
-    #grid_data['emis'] = xr.full_like(grid_data['t2m'], np.nan)
-    #grid_data['emis'][:] = grid_data['msdwlwrf'] / (grid_data['msnlwrf'] + grid_data['msdwlwrf'])
+    #era5_dynamic['emis'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    #era5_dynamic['emis'][:] = era5_dynamic['avg_sdlwrf'] / (era5_dynamic['avg_sdlwrf'] - era5_dynamic['avg_snlwrf'])
+    #era5_dynamic['emis'][:] = era5_dynamic['msdwlwrf'] / (era5_dynamic['msnlwrf'] + era5_dynamic['msdwlwrf'])
+    
+    # Diffuse radiation !!
+    #era5_dynamic['difr'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    #era5_dynamic['difr'][:] = (era5_dynamic['ssrd'] - era5_dynamic['fdir']) / 1e6
     
     # Upward longwave radiation
-    #grid_data['uwlr'] = xr.full_like(grid_data['t2m'], np.nan)
-    #grid_data['uwlr'][:] = grid_data['msnlwrf'] - grid_data['msdwlwrf']
+    #era5_dynamic['uwlr'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    #uwlr_wm2 = era5_dynamic['avg_sdlwrf'] - era5_dynamic['avg_snlwrf']
+    # Convert to MJ m^-2 hr^-1 as in the paper
+    #era5_dynamic['uwlr'][:] = uwlr_wm2 * 0.0036  # (W m^-2) * 3600 s / 1e6 J/MJ
+    #era5_dynamic['uwlr'][:] = era5_dynamic['msnlwrf'] - era5_dynamic['msdwlwrf']
     
-    # Diffuse radiation
-    grid_data['difr'] = xr.full_like(grid_data['t2m'], np.nan)
-    grid_data['difr'][:] = grid_data['ssrd'] - grid_data['fdir'] 
+    # T2-Td difference
+    era5_dynamic['dt2md2m'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    era5_dynamic['dt2md2m'] = era5_dynamic['t2m']-era5_dynamic['d2m']
     
-    # T-Td difference
-    #grid_data['dt2m'] = xr.full_like(grid_data['t2m'], np.nan)
-    #grid_data['dt2m'] = grid_data['t2m']-grid_data['d2m']
+    # T2-T0 difference
+    era5_dynamic['dt2mskt'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    era5_dynamic['dt2mskt'] = era5_dynamic['t2m']-era5_dynamic['skt']
+    
+    # Tsoil-T0 difference
+    era5_dynamic['dstl1skt'] = xr.full_like(era5_dynamic['t2m'], np.nan)
+    era5_dynamic['dstl1skt'] = era5_dynamic['stl1']-era5_dynamic['skt']
     
     #for v in help_vars + ['d2m', 'msdwlwrf', 'msnlwrf', 'uwlr', 'ssrd', 'fdir']:
     #for v in help_vars + ['msdwlwrf', 'msnlwrf', 'uwlr', 'ssrd', 'fdir', 'tcc', 'sp']:
-    for v in help_vars + ['avg_sdlwrf', 'avg_snlwrf', 'ssrd', 'fdir', 'tcc', 'sp']:
-        if v in grid_data.data_vars:
-            grid_data = grid_data.drop(v)
+    
+    #for v in help_vars + ['avg_sdlwrf', 'avg_snlwrf', 'ssrd', 'fdir', 'tcc', 'sp']:
+    #drop_vrbs = ['d2m','ssrd','fdir','avg_sdlwrf','avg_snlwrf','ssrd','fdir','tcc','sp']
+    #drop_vrbs = ['tcc','sp','ssrd','fdir'] + help_vars
+    for v in help_vars:
+        if v in era5_dynamic.data_vars:
+            era5_dynamic = era5_dynamic.drop_vars(v)
     
     
     # Lag data 
-    drop_vrbs = list(grid_data.data_vars)
+    drop_vrbs = list(era5_dynamic.data_vars)
     for v in drop_vrbs:
         for lag in lags:
             sign = '+'
             if np.sign(lag)==1: sign = '-'
-            v_lag = f'E5_{v}_{sign}{str(np.abs(lag)).zfill(3)}'
+            v_lag = f'E5dyna_{v}_{sign}{str(np.abs(lag)).zfill(3)}'
             
-            grid_data[v_lag] = grid_data[v].shift(time=lag)
-
+            era5_dynamic[v_lag] = era5_dynamic[v].shift(time=lag)
     
-    grid_data = grid_data.drop(drop_vrbs)
+    era5_dynamic = era5_dynamic.drop_vars(drop_vrbs)
     
     
-    return grid_data
+    
+    # ERA5 static variables
+    print('Reading ERA5 static')
+    era5_static = xr.open_dataset(era5_dir+'era5_static_surface_variables.nc')
+    era5_static = adjust_lats_lons(era5_static).sel(lat=slice(lats[0], lats[1]), 
+                                                    lon=slice(lons[0], lons[1]))
+    
+    #era5_static = era5_static.drop(['valid_time','number','expver']).squeeze()
+    drop_coords = ['valid_time','expver','number']
+    for v in drop_coords:
+        if v in era5_static.coords:
+            era5_static = era5_static.drop(v).squeeze()
+    
+    for v in era5_static.data_vars:
+        if not v in era5_vars:
+            era5_static = era5_static.drop_vars(v)
+    
+    for v in era5_static.data_vars:
+        era5_static = era5_static.rename({v: 'E5stat_'+v})
+    
+    era5_data =  xr.merge([era5_dynamic, era5_static])
+    
+    for v in era5_data.data_vars: print(v)
+    
+    return era5_data
 
 
 
@@ -1120,7 +1198,7 @@ def read_microclimf(fs, dirs, interp_object=[]):#points=[]):
     return ds_all_vrbs
 
 
-
+"""
 import terrain_feature_engineering as tfe
 def read_dem(file_path, region):
     
@@ -1157,6 +1235,41 @@ def read_dem(file_path, region):
     features_other = tfe.build_static_predictors(dem)
     
     dem = xr.merge([dem,features_other])
+    
+    for v in dem.data_vars:
+        dem = dem.rename({v:'St_'+v})
+        print(v, 'St_'+v)  
+    
+    
+    return dem
+"""
+
+
+
+
+import terrain_feature_engineering as tfe
+def read_dem(file_path, region):
+    
+    dem = xr.open_dataset(f'{file_path}/dem_features_{region}.nc').load() 
+    
+    vrbs = list(dem.data_vars)
+    vrb0 = 'dem10m'
+    
+    
+    include_list = ['dem10m',
+                    'pisr_1','pisr_2','pisr_3','pisr_4','pisr_5','pisr_6',
+                    'pisr_7','pisr_8','pisr_9','pisr_10','pisr_11','pisr_12',
+                    'windexp500','svf','mbi','norm_height','mpi2000','mid_slope_position',
+                    'swi_suction16', 'swi_suction256',
+                    'diurnalaniheat',]
+    
+    for vrb in vrbs:
+        if vrb not in include_list: # and vrb in vrbs:
+            dem = dem.drop(vrb)
+    
+    
+    features = tfe.build_static_predictors(dem)
+    dem = xr.merge([dem,features])
     
     for v in dem.data_vars:
         dem = dem.rename({v:'St_'+v})
@@ -1474,8 +1587,7 @@ def params_lasso():
 
 
 from sklearn.ensemble import BaggingRegressor
-from sklearn.linear_model import LassoLarsCV, QuantileRegressor
-from sklearn.linear_model import LassoCV, ElasticNetCV, MultiTaskLassoCV
+from sklearn.linear_model import LassoLarsCV, LassoCV
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import QuantileTransformer
 from sklearn.pipeline import Pipeline
@@ -1485,6 +1597,8 @@ import warnings
 
 warnings.filterwarnings('ignore', category=ConvergenceWarning)
 
+
+"""
 def bagging_model(X, Y, params,):
     # Clean data
     X = X.ffill().bfill().fillna(0)
@@ -1516,22 +1630,108 @@ def bagging_model(X, Y, params,):
     model.fit(X, Y)
 
     return model
+"""
 
 
-
-
-def bagging_model_fast(X, Y, params):
-    # Clean (keep float64 to avoid Gram issues)
-    X = np.asarray(X.ffill().bfill().fillna(0.0), dtype=np.float64)
-    Y = np.asarray(Y.ffill().bfill().fillna(0.0), dtype=np.float64)
-
+def bagging_model_LassoLarsCV(X, Y, params,):
+    # Clean data
+    X = np.asarray(X.ffill().bfill().fillna(0.0), dtype=np.float32)
+    Y = np.asarray(Y.ffill().bfill().fillna(0.0), dtype=np.float32)
+    
     cv = KFold(3, shuffle=False)
+    steps = [('normalizer', QuantileTransformer(output_distribution='normal')), 
+             ('lasso', LassoLarsCV(cv=cv, eps=0.1, max_iter=1000))]
+    
+    base_estim = Pipeline(steps)
+
+    # Bagging wrapper — use n_jobs=1 here to avoid oversubscription
+    bagging = BaggingRegressor(
+        estimator=base_estim,
+        n_estimators=params['n_estimators'],
+        max_samples=params['p_smpl'], 
+        max_features=params['p_feat'],
+        bootstrap=False,
+        bootstrap_features=False,
+        oob_score=False,
+        n_jobs=1,  # single-threaded inside BaggingRegressor
+        random_state=99,
+        verbose=False)
+
+    # Multi-output wrapper 
+    model = MultiOutputRegressor(bagging, n_jobs=50)
+
+    # Fit model
+    model.fit(X, Y)
+
+    return model
+
+
+
+
+from sklearn.linear_model import LassoLars, LassoLarsIC
+from joblib import parallel_backend
+from sklearn.base import clone
+
+def bagging_model_LassoLars(
+    X, Y, params,
+    n_quantiles_cap=1024,
+    max_iter=1000,
+    n_nonzero_coefs=256,
+    ic="bic",
+    ic_rows=200_000,          # rows for alpha selection
+    ic_targets_sample=8,      # targets to sample for alpha
+    mo_jobs=20                # modest parallelism
+):
+    print('Cleaning and preparing data')
+    # Keep pandas until fitting the pipeline to use .iloc safely
+    X_df = X.ffill().bfill().fillna(0.0)
+    Y_df = Y.ffill().bfill().fillna(0.0)
+
+    # --- Quantile transformer TEMPLATE (pipeline will fit this ONCE) ---
+    qt_tpl = QuantileTransformer(
+        output_distribution="normal",
+        n_quantiles=min(n_quantiles_cap, len(X_df)),
+        subsample=min(200_000, len(X_df)),
+        random_state=0,
+        copy=True   # avoid mutating inputs
+    )
+
+    # --- Choose alpha ONCE via LassoLarsIC on a subsample ---
+    print('Random sampling for finding optimal alpha')
+    rng = np.random.default_rng(0)
+    idx = rng.choice(len(X_df), size=min(len(X_df), ic_rows), replace=False)
+
+    qt_ic = clone(qt_tpl)
+    X_ic = X_df.iloc[idx].to_numpy(np.float32, copy=True)
+    Y_ic = Y_df.iloc[idx].to_numpy(np.float64, copy=False)  # LARS prefers float64
+    Xq_ic = qt_ic.fit_transform(X_ic).astype(np.float64, copy=False)
+
+    t = Y_ic.shape[1]
+    n_pick = min(ic_targets_sample, t)
+    tgt_idx = np.arange(t) if n_pick == t else rng.choice(t, size=n_pick, replace=False)
+
+    alphas = []
+    for j in tgt_idx:
+        yj = Y_ic[:, j]
+        ic_est = LassoLarsIC(criterion=ic, max_iter=max_iter)  # no normalize arg
+        ic_est.fit(Xq_ic, yj)
+        alphas.append(float(ic_est.alpha_))
+    alpha_star = float(np.median(alphas))
+
+    # --- Fixed-α base estimator (bounded path) ---
+    base = LassoLars(
+        alpha=alpha_star,
+        max_iter=max_iter,
+        fit_intercept=True,
+        fit_path=False,
+        precompute=False,
+    )
 
     bag = BaggingRegressor(
-        estimator=LassoCV(cv=cv, max_iter=5000, precompute=False, n_jobs=1, random_state=0),
-        n_estimators=params['n_estimators'],
-        max_samples=params['p_smpl'],
-        max_features=params['p_feat'],
+        estimator=base,
+        n_estimators=params.get("n_estimators", 30),
+        max_samples=params.get("max_samples", 100_000),  # use absolute int for tall data
+        max_features=params.get("p_feat", 0.7),
         bootstrap=False,
         bootstrap_features=False,
         oob_score=False,
@@ -1540,19 +1740,23 @@ def bagging_model_fast(X, Y, params):
         verbose=False
     )
 
-    # Fit QuantileTransformer ONCE, then bag across targets (modest parallelism)
     model = Pipeline([
-        ('normalizer', QuantileTransformer(output_distribution='normal',
-                                           n_quantiles=min(1024, len(X)),
-                                           subsample=min(100_000, len(X)),
-                                           random_state=0)),
-        ('bag_multi', MultiOutputRegressor(bag, n_jobs=min(8, Y.shape[1]))),
+        ("qt", qt_tpl),  # pipeline fits this ONCE on RAW X_df
+        ("mo_bag", MultiOutputRegressor(bag, n_jobs=min(mo_jobs, Y_df.shape[1]))),
     ])
 
-    model.fit(X, Y)
-    return model
+    print('Fitting LARS bag (threading backend)')
+    with parallel_backend("threading"):
+        model.fit(X_df, Y_df)  # pass RAW data; pipeline handles QT
+
+    return {"model": model, "alpha": alpha_star, "alphas_sampled": alphas}
 
 
+
+def predict_bagging(bundle, X):
+    model = bundle["model"]     # pipeline: QT -> bagged LARS
+    X = X.ffill().bfill().fillna(0.0)
+    return model.predict(X).squeeze()
 
 
 

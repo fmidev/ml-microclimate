@@ -12,15 +12,26 @@ from datetime import timedelta
 
 import xgboost as xgb
 
-
-
-# set spill directory
-os.environ['DASK_TEMPORARY_DIRECTORY'] = '/lustre/tmp/kamarain/dask-spill' 
-
 # Launch a Dask client
 #from dask.distributed import Client
 #client = Client(n_workers=12, threads_per_worker=1, memory_limit='32GB')
 #print(client)
+
+
+# set environment variables
+os.environ['DASK_TEMPORARY_DIRECTORY'] = '/lustre/tmp/kamarain/dask-spill' 
+os.environ['CARTOPY_DATA_DIR'] = '/lustre/tmp/kamarain/resiclim-microclimate/cartopy_data/cartopy'
+
+import cartopy
+cartopy.config["pre_existing_data_dir"] = os.environ["CARTOPY_DATA_DIR"]
+cartopy.config["data_dir"] = os.environ["CARTOPY_DATA_DIR"]
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+
+
+
+#_ = cfeature.COASTLINE.geometries()
 
 
 
@@ -32,7 +43,7 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
 
-#import matplotlib; matplotlib.use('agg')
+import matplotlib; matplotlib.use('agg')
 import matplotlib.pyplot as plt
 
 from matplotlib.colors import LogNorm
@@ -49,16 +60,8 @@ rslt_dir='/lustre/tmp/kamarain/resiclim-microclimate/'
 era5_dir='/lustre/tmp/kamarain/ERA5_NFin/' 
 
 
-# Remote directory path
-inpt_dir = 'resiclim-microclimate/varrio_5_month/'
-
-
-regions = ['RAS', 'TII', 'KIL', 'PAL', 'ULV', 'VAR']
-
-temp_levels = {'T1': '-6', 'T2': '0', 'T3': '15'}
-
-
-today = str(datetime.datetime.now().date())
+# Remote directory path for Microclimf simulations
+inpt_dir_microclimf = 'resiclim-microclimate/varrio_5_month/'
 
 
 
@@ -70,24 +73,233 @@ fcts=importlib.reload(fcts)
 
 
 
-# Set up the S3 file system
-access = os.getenv('S3_RESIC_FMI_ACCESS') 
-secret = os.getenv('S3_RESIC_FMI_SECRET') 
-
-fs = s3fs.S3FileSystem(anon=False, key=access, secret=secret,
-    client_kwargs={'endpoint_url': 'https://a3s.fi'})
+# Metadata
+_, _, _, _, regions = fcts.get_metadata()
 
 
+target_variables = ['T1', 'T2', 'T3']
+
+temp_levels = {'T1': '-6', 'T2': '0', 'T3': '15'}
 
 
+today = str(datetime.datetime.now().date())
 
-
-
-
+version = '15-10-2025'
 
 
 
-#logger_data = pd.read_csv(rslt_dir+'logger_data_selected.csv', index_col=False, parse_dates=['time'])
+
+
+
+# Visualize 2-dimensional cross-validation
+
+
+#yrs = np.arange(2019,2026)   # time axis
+#pts = np.arange(1,7)            # spatial axis
+
+yrs = np.array([2021, 2022, 2023])   # time axis
+pts = np.array([1, 2, 3])            # spatial axis
+
+time_folds = len(yrs)
+spat_folds = len(pts)
+
+t_fold = KFold(n_splits=time_folds, shuffle=False)
+s_fold = KFold(n_splits=spat_folds, shuffle=False)
+
+
+fig, axs = plt.subplots(spat_folds, time_folds, figsize=(6,6),)# sharex=True, sharey=True)
+axs = np.asarray(axs)
+
+# nice limits/ticks
+for ax in axs.ravel():
+    ax.set_xlim(yrs.min()-0.5, yrs.max()+0.5)
+    ax.set_ylim(pts.min()-0.5, pts.max()+0.5)
+    #ax.set_xticks(np.arange(yrs.min()-1, yrs.max()+2, 1))
+    ax.set_xticks(yrs)
+    ax.set_yticks(pts)
+    ax.grid(True, alpha=0.25)
+
+
+for col, (t_trn, t_tst) in enumerate(t_fold.split(yrs)):
+    t_test = yrs[t_tst][0]
+    t_train = yrs[t_trn]             # times NOT equal to t_test
+    for row, (s_trn, s_tst) in enumerate(s_fold.split(pts)):
+        s_test = pts[s_tst][0]
+        s_train = pts[s_trn]         # spaces NOT equal to s_test
+        ax = axs[row, col]
+
+        # TRAIN: all pairs (time in t_train) × (space in s_train) -> 4 blue dots
+        for tt in t_train:
+            for ss in s_train:
+                ax.scatter(tt, ss, s=600, c='royalblue', edgecolors='k', label='Train')
+
+        # TEST: the excluded intersection (t_test, s_test) -> 1 red dot
+        ax.scatter([t_test], [s_test], s=600, c='tomato', edgecolors='k', label='Test')
+
+# --- labels (Time = columns, Spatial = rows) ---
+for ax, col in zip(axs[-1], range(1, axs.shape[1]+1)):
+    ax.set_xlabel(f'Time Fold {col}', size='large')
+
+for ax, row in zip(axs[:, 0], range(1, axs.shape[0]+1)):
+    ax.set_ylabel(f'Spatial Fold {row}', rotation=90, size='large')
+
+# --- legend (dedup) & layout ---
+handles, labels = axs[0, 0].get_legend_handles_labels()
+by_label = dict(zip(labels, handles))
+fig.legend(by_label.values(), by_label.keys(), loc=[0.62, 0.67], markerscale=0.5)
+plt.tight_layout()
+
+#fig.subplots_adjust(hspace=0.02, wspace=0.02)
+
+# --- save/show ---
+fig.savefig(rslt_dir + f'fig_kfold_principle_TOMS_{time_folds}_{spat_folds}_{today}.pdf')
+fig.savefig(rslt_dir + f'fig_kfold_principle_TOMS_{time_folds}_{spat_folds}_{today}.png', dpi=200)
+plt.show()
+
+
+
+
+
+
+
+# Read ERA5 predictor data for the Northern Finland and Fennoscandia
+lat_range, lon_range = [62, 72], [19, 32]
+era5_data = fcts.read_era5(era5_dir, lat_range, lon_range, [0], pd.date_range('2019-01-01','2025-08-31',freq='1h'))
+
+era5_subsample = era5_data.sel(time=slice('2019-01-01','2024-12-31'))
+sd = era5_subsample['E5dyna_sd_+000'].compute()
+
+# --- 1. Define winter year for each timestep (hourly data) ---
+# Winter year is assigned to the year of September–August season
+winter_year = xr.where(
+    sd['time'].dt.month >= 9,
+    sd['time'].dt.year,
+    sd['time'].dt.year - 1
+).astype('int16')
+
+# Use .values so assign_coords gets raw ndarray, not a DataArray
+sd = sd.assign_coords(winter_year=('time', winter_year.values))
+
+# --- 2. Define snow presence ---
+threshold = 0.01  # meters of snow depth (1 cm) – adjust if you want
+snow_present = sd > threshold
+
+# Collapse from hourly to daily: snow present if any hour that day has snow
+snow_daily = snow_present.resample(time='1D').max()
+
+# --- 3. Recompute winter_year for daily data and assign as coord ---
+winter_year_daily = xr.where(
+    snow_daily['time'].dt.month >= 9,
+    snow_daily['time'].dt.year,
+    snow_daily['time'].dt.year - 1
+).astype('int16')
+
+snow_daily = snow_daily.assign_coords(
+    winter_year=('time', winter_year_daily.values)
+)
+
+# --- 4. Snow season length (days with snow) for each winter & gridcell ---
+snow_season_length = snow_daily.groupby('winter_year').sum(dim='time')
+snow_season_length.name = 'snow_season_length_days'
+
+print(snow_season_length)
+
+ssl_mean = snow_season_length.mean('winter_year')#.compute()
+
+"""
+# 1) Compute temporal mean (efficient if dask-backed)
+#    If you ever hit many-small-task overhead, do: .chunk({'time': -1}) first.
+
+skt_mean = era5_subsample['E5dyna_skt_+000'].mean('time', skipna=True).compute()  # Kelvin
+skt_mean = (era5_subsample['E5dyna_skt_+000'] - 273.15).mean('time', skipna=True).compute() # °C
+#skt_mean -= 273.15 # °C
+
+sd_max_mean = era5_subsample['E5dyna_sd_+000'].groupby('time.year').max('time', skipna=True).mean('year').compute()*100 # cm
+
+# skt_mean = (era5_subsample['E5dyna_skt_+000'] - 273.15).mean('time', skipna=True).compute()
+"""
+
+
+# 2) Projections
+lons = era5_subsample['lon'].values
+lats = era5_subsample['lat'].values
+pc = ccrs.PlateCarree()
+proj = ccrs.LambertConformal(
+    central_longitude=float(lons.mean()),
+    central_latitude=float(lats.mean()),
+    standard_parallels=(float(lats.min()+1.0), float(lats.max()-1.0))
+)
+
+
+
+
+region_coords = pd.DataFrame(columns=['lon','lat','x','y'], index=['KIL','PAL','RAS','TII','ULV','VAR'])
+region_coords[:] = np.array(
+[[20.848526,  69.033211,  254710.914765,  7.670383e+06],
+[24.126087,  67.996820,  379876.416491,  7.545304e+06],
+[26.345332,  69.988107,  474996.658837,  7.764681e+06],
+[28.319401,  63.646793,  565344.697085,  7.058331e+06],
+[30.362338,  63.976748,  664537.565052,  7.098764e+06],
+[29.598312,  67.738455,  609819.891495,  7.516010e+06]])
+
+
+
+# 3) Figure & map
+fig = plt.figure(figsize=(5.5, 8))
+ax = plt.axes(projection=proj)
+
+# Nice padded extent (PlateCarree CRS)
+pad = -1.5
+extent = [float(lons.min()+2.0), float(lons.max()-1.3),
+          float(lats.min()+1.0), float(lats.max()-1.0)]
+ax.set_extent(extent, crs=pc)
+
+# 4) Plot with xarray's plotting
+#    xarray forwards kwargs to matplotlib, including transform/shading/robust.
+#    We pass the target ax and CRS transform once; no manual mesh needed.
+im = ssl_mean.plot.imshow(
+    ax=ax,
+    levels=12,
+    interpolation='gaussian',
+    transform=pc,          # data are in lon/lat
+    x='lon', y='lat',      # be explicit (helps future-proofing)
+    cmap='GnBu',          
+    robust=True,           # ignore extreme outliers for color scale
+    add_colorbar=True,
+    cbar_kwargs=dict(orientation='vertical', pad=0.05, shrink=0.75,label='')   # label='°C')  
+)
+
+
+# 5) Add boundaries & shorelines
+ax.add_feature(cfeature.COASTLINE, linewidth=0.7)
+ax.add_feature(cfeature.BORDERS, linewidth=0.5)
+ax.add_feature(cfeature.LAKES, edgecolor='gray', facecolor='none', linewidth=0.3)
+ax.add_feature(cfeature.RIVERS, edgecolor='gray', linewidth=0.2)
+
+# 6) Gridlines with labels
+gl = ax.gridlines(draw_labels=True, crs=pc, x_inline=False, y_inline=False, lw=0.5)
+gl.top_labels = False
+gl.right_labels = False
+
+# 7) Study regions with labels
+ax.scatter(region_coords['lon'], region_coords['lat'], transform=pc, s=80, color='r', edgecolors='k',zorder=99)
+for i,region in enumerate(region_coords.index):
+   ax.text(region_coords.loc[region,'lon'], region_coords.loc[region,'lat']+0.2, region, 
+           transform=pc, bbox=dict(facecolor='w', alpha=1, boxstyle='round', pad=0.1), ha='center', va='bottom')
+
+
+# 8) Title & save
+t0 = np.datetime_as_string(era5_data.time.values[0], unit='D')
+t1 = np.datetime_as_string(era5_data.time.values[-1], unit='D')
+#ax.set_title(f'Annual mean ERA5 skin temperature (2019–2025)')
+#ax.set_title(f'Annual maximum ERA5 snow depth,\nmean over years 2019–2024')
+ax.set_title(f'Annual ERA5 snow season (days),\nmean over years 2019–2024')
+
+plt.tight_layout()
+fig.savefig(rslt_dir + f'fig_fennoscandia_{today}.png', dpi=200)
+fig.savefig(rslt_dir + f'fig_fennoscandia_{today}.pdf')
+
+plt.show()
 
 
 
@@ -158,9 +370,9 @@ def mean_std_text(input_dict): #err_era, err_xgb, err_rfr):
 
 
 
-read_computed_results = False
+read_process_computed_results = True
 
-if read_computed_results:
+if read_process_computed_results:
     
     refr_pths = {'KIL': '/lustre/tmp/kamarain/resiclim-microclimf/KIL_AIL/*',
                  'PAL': '/lustre/tmp/kamarain/resiclim-microclimf/PAL/*',
@@ -234,57 +446,693 @@ if read_computed_results:
 
 
 
-if not read_computed_results:
+if not read_process_computed_results:
     Y = pd.read_csv(f'{rslt_dir}Y.csv', index_col=False)
 
 
 
 
 # Data for text
-y = Y.dropna(axis=0)
-for name, mth_grouping in zip(['ALL','SUMMER'], [range(1,13), range(5,10)]):
-    # All data
-    idx = np.isin(pd.to_datetime(y.time.values).month, mth_grouping)
-    round_decimals = 1
-    print(f'{name} mths XGBo rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'xgboost_T3']).round(round_decimals))
-    print(f'{name} mths LSSO rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'lasso_T3']).round(round_decimals))
-    print(f'{name} mths ERA5 rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'E5_skt_degC']).round(round_decimals))
-    if 'microclimf_T3' in y: 
-        print(f'{name} mths MCLF rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'microclimf_T3']).round(round_decimals))
+y = Y.dropna(axis=0) # Include only VAR and KIL
 
-    round_decimals = 2
-    print(f'{name} mths XGBo corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'xgboost_T3']).round(round_decimals))
-    print(f'{name} mths LSSO corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'lasso_T3']).round(round_decimals))
-    print(f'{name} mths ERA5 corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'E5_skt_degC']).round(round_decimals))
-    if 'microclimf_T3' in y: 
-        print(f'{name} mths MCLF corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'microclimf_T3']).round(round_decimals))
-
-    print('\n')
-
-
-
-# Data for tables
-for name, mth_grouping in zip(['ALL','SUMMER'], [range(1,13), range(5,10)]):
-    for region in regions:
+# RMSE overall for text
+round_decimals = 2
+for target in target_variables:
+    for name, col in zip(['XGBo','MCLF','LASS','ERA5'], [f'xgboost_{target}',f'microclimf_{target}',f'lasso_{target}','E5dyna_skt_degC']):
+        idx_all = np.isin(pd.to_datetime(y.time.values).month, range(1,13))
+        idx_smr = np.isin(pd.to_datetime(y.time.values).month, range(5,10))
         
-        y = Y.loc[Y.region==region].dropna(axis=1, how='all').dropna(axis=0)
+        rms_all, rms_smr = '–', '–'
+        
+        try:
+            rms_all = fcts.calc_rmse(y.loc[idx_all,target], y.loc[idx_all,col]).round(round_decimals).astype(str)
+            rms_smr = fcts.calc_rmse(y.loc[idx_smr,target], y.loc[idx_smr,col]).round(round_decimals).astype(str)
+        except: pass
+        
+        rms = rms_all + ' / ' + rms_smr
+        print(f'{target} {name} rmse: {rms}')
 
-        idx = np.isin(pd.to_datetime(y.time.values).month, mth_grouping)
-        round_decimals = 1
-        print(f'{region} {name} mths XGBo rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'xgboost_T3']).round(round_decimals))
-        print(f'{region} {name} mths LSSO rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'lasso_T3']).round(round_decimals))
-        print(f'{region} {name} mths ERA5 rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'E5_skt_degC']).round(round_decimals))
-        if 'microclimf_T3' in y: 
-            print(f'{region} {name} mths MCLF rmse:', fcts.calc_rmse(y.loc[idx,'T3'], y.loc[idx,'microclimf_T3']).round(round_decimals))
 
-        round_decimals = 2
-        print(f'{region} {name} mths XGBo corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'xgboost_T3']).round(round_decimals))
-        print(f'{region} {name} mths LSSO corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'lasso_T3']).round(round_decimals))
-        print(f'{region} {name} mths ERA5 corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'E5_skt_degC']).round(round_decimals))
-        if 'microclimf_T3' in y: 
-            print(f'{region} {name} mths MCLF corr:', fcts.calc_corr(y.loc[idx,'T3'], y.loc[idx,'microclimf_T3']).round(round_decimals))
+# CORR overall for text
+round_decimals = 2
+for target in target_variables:
+    for name, col in zip(['XGBo','MCLF','LASS','ERA5'], [f'xgboost_{target}',f'microclimf_{target}',f'lasso_{target}','E5dyna_skt_degC']):
+        idx_all = np.isin(pd.to_datetime(y.time.values).month, range(1,13))
+        idx_smr = np.isin(pd.to_datetime(y.time.values).month, range(5,10))
+        
+        cor_all, cor_smr = '–', '–'
+        
+        try:
+            cor_all = fcts.calc_corr(y.loc[idx_all,target], y.loc[idx_all,col]).round(round_decimals).astype(str)
+            cor_smr = fcts.calc_corr(y.loc[idx_smr,target], y.loc[idx_smr,col]).round(round_decimals).astype(str)
+        except: pass
+        
+        cor = cor_all + ' / ' + cor_smr
+        print(f'{target} {name} corr: {cor}')
 
-        print('\n')
+
+
+
+
+# RMSE in regions for tables
+y = Y.copy(deep=True) # Include all regions
+round_decimals = 2
+results_list = []
+for target in target_variables:
+    for region in regions:
+        rms_vals = []
+        for name, col in zip(['XGBoost','Microclimf','Lasso','ERA5'], [f'xgboost_{target}',f'microclimf_{target}',f'lasso_{target}','E5dyna_skt_degC']):
+            idx_all = np.isin(pd.to_datetime(y.time.values).month, range(1,13)) & (y.region==region)
+            idx_smr = np.isin(pd.to_datetime(y.time.values).month, range(5,10)) & (y.region==region)
+            
+            rms_all, rms_smr = '–', '–'
+            
+            try:
+                rms_all = fcts.calc_rmse(y.loc[idx_all,target], y.loc[idx_all,col]).round(round_decimals).astype(str)
+                rms_smr = fcts.calc_rmse(y.loc[idx_smr,target], y.loc[idx_smr,col]).round(round_decimals).astype(str)
+                if np.isnan(float(rms_all)): rms_all = '–'
+                if np.isnan(float(rms_smr)): rms_smr = '–'
+            except: pass
+            
+            rms = rms_all + ' / ' + rms_smr
+            print(f'{target} {name} {region} rmse: {rms}')
+            
+            rms_vals.append(rms)
+        
+        df = pd.DataFrame(index=[0],columns=['Target','Region','XGBoost','Microclimf','Lasso','ERA5'],data=[[target, region]+rms_vals])
+        results_list.append(df)
+
+df_rmse = pd.concat(results_list).reset_index(drop=True)
+df_rmse.to_csv(rslt_dir+f'results_rmse_{today}.csv', index=False)
+
+
+
+
+# CORR in regions for tables
+y = Y.copy(deep=True) # Include all regions
+round_decimals = 2
+results_list = []
+for target in target_variables:
+    for region in regions:
+        cor_vals = []
+        for name, col in zip(['XGBoost','Microclimf','Lasso','ERA5'], [f'xgboost_{target}',f'microclimf_{target}',f'lasso_{target}','E5dyna_skt_degC']):
+            idx_all = np.isin(pd.to_datetime(y.time.values).month, range(1,13)) & (y.region==region)
+            idx_smr = np.isin(pd.to_datetime(y.time.values).month, range(5,10)) & (y.region==region)
+            
+            cor_all, cor_smr = '–', '–'
+            
+            try:
+                cor_all = fcts.calc_corr(y.loc[idx_all,target], y.loc[idx_all,col]).round(round_decimals).astype(str)
+                cor_smr = fcts.calc_corr(y.loc[idx_smr,target], y.loc[idx_smr,col]).round(round_decimals).astype(str)
+                if np.isnan(float(cor_all)): cor_all = '–'
+                if np.isnan(float(cor_smr)): cor_smr = '–'
+            except: pass
+            
+            cor = cor_all + ' / ' + cor_smr
+            print(f'{target} {name} {region} corr: {cor}')
+            
+            cor_vals.append(cor)
+        
+        df = pd.DataFrame(index=[0],columns=['Target','Region','XGBoost','Microclimf','Lasso','ERA5'],data=[[target, region]+cor_vals])
+        results_list.append(df)
+
+df_corr = pd.concat(results_list).reset_index(drop=True)
+df_corr.to_csv(rslt_dir+f'results_corr_{today}.csv', index=False)
+
+
+"""
+y = Y.copy(deep=True) # Include all regions
+df_corr = pd.DataFrame(columns=['XGBoost','Microclimf','Lasso','ERA5'], index=regions, dtype='str')
+round_decimals = 2
+for region in regions:
+    for name, col in zip(['XGBoost','Microclimf','Lasso','ERA5'], ['xgboost_T3','microclimf_T3','lasso_T3','E5dyna_skt_degC']):
+        idx_all = np.isin(pd.to_datetime(y.time.values).month, range(1,13)) & (y.region==region)
+        idx_smr = np.isin(pd.to_datetime(y.time.values).month, range(5,10)) & (y.region==region)
+        cor_all = fcts.calc_corr(y.loc[idx_all,'T3'], y.loc[idx_all,col]).round(round_decimals).astype(str)
+        cor_smr = fcts.calc_corr(y.loc[idx_smr,'T3'], y.loc[idx_smr,col]).round(round_decimals).astype(str)
+        
+        if np.isnan(float(cor_all)): cor_all = '–'
+        if np.isnan(float(cor_smr)): cor_smr = '–'
+        
+        cor = cor_all + ' / ' + cor_smr
+        print(f'{name} {region} corr: {cor}')
+        
+        df_corr.loc[region,name] = cor
+
+df_corr.to_csv(rslt_dir+f'results_corr_{today}.csv')
+"""
+
+
+
+
+
+
+# SHAP analysis
+
+shap_data = []
+years = np.arange(2019,2026)
+for region, year in itertools.product(regions, years):
+    print(region, year)
+    try:
+        df = pd.read_csv(f'{rslt_dir}shap_{region}_{year}.csv', index_col=False)
+        df[['year','region']] = year, region
+        #df_impr = pd.read_csv(f'{rslt_dir}importance_{region}_{year}.csv', index_col=False)
+        
+        shap_data.append(df)
+    except: print('No data for',region,year)
+
+df_shap = pd.concat(shap_data)
+df_shap.rename(columns={'lat':'St_lat', 'lon':'St_lon'}, inplace=True)
+
+shap_features = list(df_shap.drop(columns=['year','region']).columns)
+
+
+
+
+
+# ---- SHAP importance analysis & plotting (pandas + matplotlib only) ----
+import re
+from typing import Dict, Iterable, List, Optional, Tuple
+
+# allow underscores in the base name; lag is always _[+-]\d{3} at the end
+LAG_RE = re.compile(r'^E5dyna_(?P<var>.+)_(?P<lag>[+-]\d{3})$')
+
+def parse_feature_parts(feat: str):
+    """
+    Returns: category, family, lag_str, lag_hours (int or None)
+    """
+    # non-ERA5 static
+    if feat.startswith("St_"):
+        return "St", feat, None, None
+
+    # cyclic
+    if feat.startswith("Cycle_"):
+        return "Cycle", feat, None, None
+
+    # ERA5 static
+    if feat.startswith("E5stat_"):
+        return "E5-static", feat, None, None
+
+    # ERA5 dynamic
+    if feat.startswith("E5dyna_"):
+        m = LAG_RE.match(feat)
+        if m:
+            var = m.group("var")            # e.g. "avg_sdlwrf"
+            lag = m.group("lag")            # e.g. "+000"
+            lag_hours = int(lag)
+            family = f"E5dyna_{var}"        # e.g. "E5dyna_avg_sdlwrf"
+            return "E5-dyn", family, lag, lag_hours
+        # dynamic but no lag suffix
+        return "E5-dyn", feat, None, None
+
+    # fallback
+    return "Other", feat, None, None
+
+
+def build_meta(features: Iterable[str]) -> pd.DataFrame:
+    rows = []
+    for f in features:
+        cat, fam, lag, lag_h = parse_feature_parts(f)
+        rows.append(
+            {
+                "feature": f,
+                "category": cat,
+                "family": fam,
+                "lag": lag,
+                "lag_hours": lag_h,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+# --- 1) Categorize features ---------------------------------------------------
+def categorize_feature(col: str) -> str:
+    """
+    Map a feature name to one of the main categories with the NEW naming:
+      - 'St'        -> prefix 'St_'
+      - 'Cycle'     -> prefix 'Cycle_'
+      - 'E5-dyn'    -> prefix 'E5dyna_'
+      - 'E5-static' -> prefix 'E5stat_'
+      - 'Other'     -> everything else
+    """
+    if col.startswith("St_"):
+        return "St"
+    if col.startswith("Cycle_"):
+        return "Cycle"
+    if col.startswith("E5dyna_"):
+        return "E5-dyn"
+    if col.startswith("E5stat_"):
+        return "E5-static"
+    return "Other"
+
+
+def build_feature_catalog(features: Iterable[str]) -> pd.DataFrame:
+    cat = pd.DataFrame({"feature": list(features)})
+    cat["category"] = cat["feature"].map(categorize_feature)
+    return cat
+
+
+
+
+# --- 2) Global mean |SHAP| per feature (memory-safe) --------------------------
+def mean_abs_shap_by_feature(df: pd.DataFrame, features: Iterable[str]) -> pd.Series:
+    """
+    Compute mean absolute SHAP per feature without creating a giant absolute-value copy.
+    """
+    out = {}
+    n = len(df)
+    for col in features:
+        # column-wise abs().mean() to avoid a 100-column abs() frame in memory
+        out[col] = df[col].abs().mean()
+    s = pd.Series(out).sort_values(ascending=False)
+    s.name = "mean_abs_shap"
+    return s
+
+# --- 3) Aggregate by category --------------------------------------------------
+def aggregate_by_category(mean_abs: pd.Series, catalog: pd.DataFrame) -> pd.Series:
+    m = catalog.set_index("feature")["category"]
+    cat_sum = mean_abs.groupby(m).sum().sort_values(ascending=False)
+    cat_sum.name = "mean_abs_shap_sum"
+    return cat_sum
+
+# --- 4) Per-year / per-region summaries (chunked) -----------------------------
+def mean_abs_shap_grouped(
+    df: pd.DataFrame, 
+    features: Iterable[str], 
+    by: List[str]
+) -> pd.DataFrame:
+    """
+    Compute mean |SHAP| per feature grouped by 'by' keys (e.g., ['year'], ['region'], or ['year','region']).
+    Returns a DataFrame indexed by by with columns = features.
+    Done group-by-chunk to keep memory reasonable.
+    """
+    results = []
+    for keys, grp in df.groupby(by, sort=False):
+        vals = {f: grp[f].abs().mean() for f in features}
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        results.append((*keys, *[vals[f] for f in features]))
+    idx_cols = list(by)
+    res = pd.DataFrame(
+        results, 
+        columns=idx_cols + list(features)
+    ).set_index(idx_cols)
+    return res
+
+def collapse_to_categories(
+    feature_table: pd.DataFrame, 
+    catalog: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Sum feature-level stats into categories (columns = categories).
+    """
+    cat_map = catalog.set_index("feature")["category"]
+    # Reindex to ensure all features align; missing features ignored
+    aligned = feature_table.reindex(columns=cat_map.index)
+    # For each category, sum its member columns
+    cat_cols = {}
+    for cat in sorted(cat_map.unique()):
+        members = cat_map[cat_map == cat].index
+        # sum along columns; skip if none present
+        present = [m for m in members if m in aligned.columns]
+        if present:
+            cat_cols[cat] = aligned[present].sum(axis=1)
+    return pd.DataFrame(cat_cols, index=feature_table.index)
+
+
+# ------- Per-year / per-region FAMILY summaries -------------------------------
+def grouped_mean_abs(df, features, by):
+    out = []
+    for keys, grp in df.groupby(by, sort=False):
+        vals = {f: grp[f].abs().mean() for f in features}
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        out.append((*keys, *[vals[f] for f in features]))
+    idx = list(by)
+    return pd.DataFrame(out, columns=idx + list(features)).set_index(idx)
+
+
+
+
+def collapse_to_family(feature_table, meta, family_col='family_group'):
+    fam_map = meta.set_index('feature')[family_col]
+    aligned = feature_table.reindex(columns=fam_map.index)
+    fam_cols = {}
+    for fam, members in fam_map.groupby(fam_map):
+        members = members.index
+        present = [m for m in members if m in aligned.columns]
+        if present:
+            fam_cols[fam] = aligned[present].sum(axis=1)
+    return pd.DataFrame(fam_cols, index=feature_table.index)
+
+
+
+
+
+# --- 5) Plotting helpers -------------------------------------------------------
+def plot_category_breakdown(cat_sum: pd.Series, title: str = "SHAP importance by category"):
+    plt.figure(figsize=(7,4)); plt.xscale('log')
+    cat_sum.plot(kind="barh")
+    plt.ylabel("Sum of mean |SHAP|")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(rslt_dir+f'fig_SHAP_category_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_SHAP_category_{today}.png', dpi=200)
+    plt.show()
+
+"""
+def plot_top_features(mean_abs: pd.Series, top_n: int = 20, title: str = "Top features by mean |SHAP|"):
+    plt.figure(figsize=(8, max(3, 0.35*top_n))); plt.xscale('log')
+    mean_abs.head(top_n).sort_values().plot(kind="barh")
+    plt.xlabel("Mean |SHAP|")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(rslt_dir+f'fig_SHAP_top{top_n}_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_SHAP_top{top_n}_{today}.png', dpi=200)
+    plt.show()
+
+
+def plot_top_features(series, top_n=20, title="Top features by mean |SHAP|"):
+    s = series.dropna().nlargest(top_n);         # <-- selects the true top-N
+    plt.figure(figsize=(8, max(3, 0.35*top_n))); plt.xscale('log')
+    s.sort_values().plot(kind="barh")            # sort for a tidy horizontal plot
+    plt.xlabel("Mean |SHAP|")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(rslt_dir+f'fig_SHAP_top{top_n}_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_SHAP_top{top_n}_{today}.png', dpi=200)
+    plt.show()
+
+"""
+
+
+
+def plot_top_features(data, top_n=20, title="Top features by mean |SHAP|", by_region=False):
+    """
+    If by_region=False:
+        - `data` can be a Series of global mean |SHAP| per feature.
+    If by_region=True:
+        - `data` must be a DataFrame like fam_by_yrreg with a MultiIndex on rows
+          containing 'region' (and typically 'year'), and columns = features/families.
+        - The plot shows stacked bars where each segment is the (row-count-weighted)
+          regional contribution to the global mean |SHAP|.
+    """
+
+    if not by_region:
+        # --- Fixed behavior: true top-N selection ---
+        s = data.dropna().nlargest(top_n)
+        plt.figure(figsize=(8, max(3, 0.35*top_n))); plt.xscale('log')
+        s.sort_values().plot(kind="barh")
+        plt.xlabel("Mean |SHAP|")
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+        return
+
+    # --- stacked-by-region version ---
+    if not isinstance(data, pd.DataFrame) or \
+       not isinstance(data.index, pd.MultiIndex) or \
+       "region" not in data.index.names:
+        raise ValueError("by_region=True expects a DataFrame with a MultiIndex rows including 'region' (e.g., fam_by_yrreg).")
+
+    # Region weights so the sum of segments equals the true global mean across all (year, region) rows
+    counts = data.groupby(level="region").size()
+    weights = counts / counts.sum()
+
+    # Regional mean per feature (averaging over years within each region)
+    region_means = data.groupby(level="region").mean()  # shape: [regions x features]
+
+    # Weighted regional contributions; columns still = features
+    contrib = region_means.mul(weights, axis=0)
+
+    # Total (global) mean per feature from the weighted regional contributions
+    total = contrib.sum(axis=0)
+
+    # Pick the true top-N features globally
+    top_feats = total.dropna().nlargest(top_n).index
+
+    # Keep only those and order by total ascending for horizontal plot
+    contrib_top = contrib.loc[:, top_feats]
+    order = total[top_feats].sort_values().index
+    contrib_top = contrib_top.loc[:, order]
+
+    # Plot stacked bars (one bar per feature, stacked by region)
+    plt.figure(figsize=(10, max(3, 0.15*top_n))); plt.xscale('log')
+    y = np.arange(len(order))
+    left = np.zeros(len(order), dtype=float)
+
+    # Iterate regions in the DataFrame index order (or sort if you prefer)
+    for region in contrib_top.index:
+        vals = contrib_top.loc[region].values
+        #plt.barh(y, vals, left=left, label=region)
+        plt.barh(y, vals, left=left, height=0.95, label=region)
+        left += vals
+
+    plt.yticks(y, order)
+    plt.xlabel("mean |SHAP|")
+    plt.title(title)
+    #plt.legend(title="Region", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.legend(title='Region', loc='lower right', fontsize='x-large')
+    #plt.margins(y=0)
+    plt.ylim(-0.7, len(order)-0.3)
+    plt.tight_layout()
+    plt.savefig(rslt_dir+f'fig_SHAP_top{top_n}_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_SHAP_top{top_n}_{today}.png', dpi=200)
+    plt.show()
+
+
+
+def plot_top_features_per_category(mean_abs: pd.Series, catalog: pd.DataFrame, top_k: int = 5):
+    """
+    For each category, plot top_k features by mean |SHAP|.
+    """
+    cat_map = catalog.set_index("feature")["category"]
+    df = mean_abs.to_frame("mean_abs").join(cat_map, how="left")
+    for cat, sub in df.groupby("category"):
+        sub_sorted = sub["mean_abs"].sort_values(ascending=False).head(top_k)
+        if sub_sorted.empty:
+            continue
+        plt.figure(figsize=(7, max(2.5, 0.35*len(sub_sorted))))
+        plt.xscale('log')
+        sub_sorted.sort_values().plot(kind="barh")
+        plt.xlabel("Mean |SHAP|")
+        plt.title(f"Top {len(sub_sorted)} {cat} features")
+        plt.tight_layout()
+        plt.savefig(rslt_dir+f'fig_SHAP_top{top_k}_per_{cat}_{today}.pdf')
+        plt.savefig(rslt_dir+f'fig_SHAP_top{top_k}_per_{cat}_{today}.png', dpi=200)
+        plt.show()
+
+def heatmap_from_table(
+    table: pd.DataFrame, 
+    title: str, 
+    xlabel: str, 
+    ylabel: str, 
+    fmt: Optional[str] = None
+):
+    """
+    Render a simple heatmap from a (index x columns) numeric table.
+    """
+    from matplotlib.colors import LogNorm
+    
+    data = table.values
+    plt.figure(figsize=(1.0*table.shape[1] + 2, 0.5*table.shape[0] + 2))
+    im = plt.imshow(data, aspect="auto", cmap='hot', norm=LogNorm())
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(range(table.shape[1]), table.columns, rotation=45, ha="right")
+    plt.yticks(range(table.shape[0]), table.index)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    # optional annotation
+    if fmt is not None:
+        for i in range(table.shape[0]):
+            for j in range(table.shape[1]):
+                plt.text(j, i, format(data[i, j], fmt), ha='center', va='center')
+    plt.tight_layout()
+    plt.savefig(rslt_dir+f'fig_SHAP_heatmap_by_{title.replace(' ','_')}_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_SHAP_heatmap_by_{title.replace(' ','_')}_{today}.png', dpi=200)
+    plt.show()
+
+
+
+
+
+
+
+
+# --- Put together ---
+
+meta = build_meta(shap_features)
+
+# Create a grouping key that uses 'family' only for ERA5-dyn;
+# for all other categories use the full feature name to avoid unwanted merging.
+meta['family_group'] = np.where(
+    meta['category'] == 'E5-dyn',
+    meta['family'],          # collapse different lags of same ERA5 var
+    meta['feature']          # keep individual St_*, Cycle_*, E5-static, Other
+)
+
+
+# ------- Compute mean |SHAP| per feature (as before, column-wise for memory) --
+mean_abs = pd.Series({c: df_shap[c].abs().mean() for c in shap_features}).sort_values(ascending=False)
+mean_abs.name = 'mean_abs_shap'
+
+# ------- Aggregations including family level ----------------------------------
+# By category (overall)
+cat_overall = mean_abs.groupby(meta.set_index('feature')['category']).sum().sort_values(ascending=False)
+
+# By family (overall) – sums across lags of the same variable
+fam_overall = mean_abs.groupby(meta.set_index('feature')['family']).sum().sort_values(ascending=False)
+
+"""
+# By (category, family) table
+cat_fam_overall = (mean_abs
+                   .to_frame('mean_abs')
+                   .join(meta.set_index('feature')[['category','family']])
+                   .groupby(['category','family'])['mean_abs']
+                   .sum()
+                   .sort_values(ascending=False))
+"""
+
+# Rebuild the family-level tables using the new rule
+#fam_by_year   = collapse_to_family(feat_by_year,   meta, family_col='family_group').sort_index()
+
+#fam_by_yrreg  = collapse_to_family(feat_by_yrreg,  meta, family_col='family_group')
+
+# Optional: if you also computed overall family sums:
+fam_overall = (mean_abs
+               .to_frame('mean_abs')
+               .join(meta.set_index('feature')['family_group'])
+               .groupby('family_group')['mean_abs']
+               .sum()
+               .sort_values(ascending=False))
+
+# Optional: (year, region) x family for deeper cuts
+feat_by_year = grouped_mean_abs(df_shap, shap_features, by=['year',])
+feat_by_yrreg = grouped_mean_abs(df_shap, shap_features, by=['year','region'])
+feat_by_region = grouped_mean_abs(df_shap, shap_features, by=['region'])
+fam_by_yrreg  = collapse_to_family(feat_by_yrreg, meta)
+fam_by_region = collapse_to_family(feat_by_region, meta, family_col='family_group').sort_index()
+
+# ------- Lag breakdown within a family ---------------------------------------
+# Build a tidy table: per-feature mean_abs joined with meta
+tidy = (mean_abs.to_frame('mean_abs')
+        .assign(feature=lambda d: d.index)
+        .merge(meta, on='feature', how='left'))
+
+# get top ERA5-dyn families and plot their lag profiles
+top_fams = (tidy[tidy['category']=='E5-dyn']
+            .groupby('family')['mean_abs']
+            .sum()
+            .sort_values(ascending=False)
+            .head(8)
+            .index.tolist())
+
+
+# shap_features = list(df_shap.drop(columns=['year','region']).columns)
+catalog = build_feature_catalog(shap_features)
+
+# Global mean |SHAP| per feature
+mean_abs = mean_abs_shap_by_feature(df_shap, shap_features)
+
+# Category totals (overall)
+cat_overall = aggregate_by_category(mean_abs, catalog)
+
+# Plot: category breakdown + top features overall + top per category
+plot_category_breakdown(cat_overall, title="Global SHAP importance by category")
+plot_top_features(mean_abs, top_n=20, title="Top-20 features by mean |SHAP| (global)")
+plot_top_features_per_category(mean_abs, catalog, top_k=15)
+
+plot_top_features(fam_by_yrreg, top_n=20, title="Top-20 features by mean |SHAP| with weighted regional contributions", by_region=True)
+plot_top_features(fam_by_yrreg, top_n=40, title="Top-40 features by mean |SHAP| with weighted regional contributions", by_region=True)
+plot_top_features(fam_by_yrreg, top_n=60, title="Top-60 features by mean |SHAP| with weighted regional contributions", by_region=True)
+plot_top_features(fam_by_yrreg, top_n=80, title="All features by mean |SHAP| with weighted regional contributions", by_region=True)
+plot_top_features(fam_by_yrreg, top_n=120, title="All features by mean |SHAP| with weighted regional contributions", by_region=True)
+
+
+# Year x category heatmap
+year_feat = mean_abs_shap_grouped(df_shap, shap_features, by=["year"])
+year_cat  = collapse_to_categories(year_feat, catalog).sort_index()
+heatmap_from_table(
+    year_cat,
+    title="Mean |SHAP| by category and year",
+    xlabel="Category",
+    ylabel="Year",
+    fmt=".3f"
+)
+
+# Region x category heatmap
+region_feat = mean_abs_shap_grouped(df_shap, shap_features, by=["region"])
+region_cat  = collapse_to_categories(region_feat, catalog).sort_index()
+heatmap_from_table(
+    region_cat,
+    title="Mean |SHAP| by category and region",
+    xlabel="Category",
+    ylabel="Region",
+    fmt=".3f"
+)
+
+# (Optional) Year-Region x category heatmap (sum over categories shown separately)
+yr_reg_feat = mean_abs_shap_grouped(df_shap, shap_features, by=["year", "region"])
+yr_reg_cat  = collapse_to_categories(yr_reg_feat, catalog)
+# Example: visualize ERA5 dynamic across year-region as a heatmap
+if "E5-dyn" in yr_reg_cat.columns:
+    table = yr_reg_cat["E5-dyn"].unstack("region").sort_index()
+    heatmap_from_table(
+        table,
+        title="Mean |SHAP| for ERA5 dynamic by year-region",
+        xlabel="Region",
+        ylabel="Year",
+        fmt=".3f"
+    )
+
+if "E5-static" in yr_reg_cat.columns:
+    table = yr_reg_cat["E5-static"].unstack("region").sort_index()
+    heatmap_from_table(
+        table,
+        title="Mean |SHAP| for ERA5 static by year-region",
+        xlabel="Region",
+        ylabel="Year",
+        fmt=".3f"
+    )
+
+if "Cycle" in yr_reg_cat.columns:
+    table = yr_reg_cat["Cycle"].unstack("region").sort_index()
+    heatmap_from_table(
+        table,
+        title="Mean |SHAP| for Cycle by year-region",
+        xlabel="Region",
+        ylabel="Year",
+        fmt=".3f"
+    )
+    
+if "St" in yr_reg_cat.columns:
+    table = yr_reg_cat["St"].unstack("region").sort_index()
+    heatmap_from_table(
+        table,
+        title="Mean |SHAP| for Static features by year-region",
+        xlabel="Region",
+        ylabel="Year",
+        fmt=".3f"
+    )
+
+
+
+
+heatmap_from_table(
+    fam_by_region.T,
+    title="Mean |SHAP| for all features by region",
+    xlabel="Region",
+    ylabel="Feature",
+    fmt=".3f"
+)
+
+
+
+
+
+
+
 
 
 
@@ -299,16 +1147,17 @@ import spatiotemporal_skill_and_bioclimatic_indicators as spt
 
 #from arctic_temp_skill import ArcticTempSkill
 
-#ats = spt.ArcticTempSkill(Y.dropna(), obs_col="T3", model_cols=["xgboost_T3","lasso_T3","microclimf_T3",'E5_skt_degC'])
-ats = spt.ArcticTempSkill(Y, obs_col="T3", model_cols=["xgboost_T3","lasso_T3","microclimf_T3",'E5_skt_degC'])
+#ats = spt.ArcticTempSkill(Y.dropna(), obs_col="T3", model_cols=["xgboost_T3","lasso_T3","microclimf_T3",'E5dyna_skt_degC'])
+ats_withmclf = spt.ArcticTempSkill(Y.dropna(), obs_col="T3", model_cols=["xgboost_T3","lasso_T3","microclimf_T3",'E5dyna_skt_degC'])
+ats_withoutwmclf = spt.ArcticTempSkill(Y.drop(columns='microclimf_T3').dropna(), obs_col="T3", model_cols=["xgboost_T3","lasso_T3","microclimf_T3",'E5dyna_skt_degC'])
 
 """
 df = ats.df.copy()
-for col in ["xgboost_T3","lasso_T3","microclimf_T3",'E5_skt_degC']:
+for col in ["xgboost_T3","lasso_T3","microclimf_T3",'E5dyna_skt_degC']:
     r = df[col] - df["T3"]
     r_demean = r - r.groupby(df["site"]).transform("mean")
     df[col + "_demean_pred"] = df["T3"] + r_demean  # same units; semivariogram will use residual = model - obs
-ats_d = spt.ArcticTempSkill(df, obs_col="T3", model_cols=[c+"_demean_pred" for c in ["xgboost_T3","lasso_T3","microclimf_T3",'E5_skt_degC']])
+ats_d = spt.ArcticTempSkill(df, obs_col="T3", model_cols=[c+"_demean_pred" for c in ["xgboost_T3","lasso_T3","microclimf_T3",'E5dyna_skt_degC']])
 # recompute SS(h) with these *_demean_pred columns
 ats = ats_d
 """
@@ -319,20 +1168,208 @@ ats = ats_d
 overall = ats.summarize_regression()
 by_region = ats.summarize_regression(groupby="region")
 by_month = ats.summarize_regression(groupby=["month","site"])
-by_allgroups = ats.summarize_regression(groupby=["month","region","site"])
+by_monreg = ats.summarize_regression(groupby=["month","region"])
+by_allgroups = ats.summarize_regression(groupby=["year","month","region","site"])
 
-
-sns.boxplot(by_allgroups, x='region', y='R', hue='model'); plt.show()
-sns.boxplot(by_allgroups, x='month', y='R', hue='model'); plt.show()
+#sns.boxplot(by_allgroups, x='region', y='R', hue='model'); plt.show()
+#sns.boxplot(by_allgroups, x='month', y='R', hue='model'); plt.show()
 #sns.boxplot(by_allgroups, x='site', y='R', hue='model'); plt.show()
 
+#fcts.plot_ridgeline(by_allgroups, metric="RMSE", group_col="model", max_groups=4, title="RMSE by model")
 
-fcts.plot_ridgeline(by_allgroups, metric="RMSE", group_col="model", max_groups=4, title="RMSE by model")
+for metric in ['RMSE','Bias','R','R2']:
+    metric = 'R2'
+    sns.set_theme(style="whitegrid")
+    sns.displot(
+        data=by_allgroups,
+        x=metric, hue="model", #y='RMSE',
+        kind="kde", height=6,
+        multiple="fill", clip=(0, None),
+        palette="ch:rot=-.25,hue=1,light=.75",)
+
+    plt.savefig(rslt_dir+f'fig_displot_{metric}_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_displot_{metric}_{today}.png', dpi=200)
+    plt.show()
+
+
+
+
+
+sns.set_theme(style="darkgrid")
+
+f_all, axes_all = plt.subplots(3,2, figsize=(12, 9),)# sharex=True, sharey=True)
+for i,metric in enumerate(['RMSE','MAE','Bias','R','R2']): 
+    print('Monthly lineplot',metric)
+    
+    
+    f, axes = plt.subplots(3,2, figsize=(12, 9),)# sharex=True, sharey=True)
+    for ax, region in zip(axes.flat, regions):
+        
+        sns.lineplot(data=by_allgroups.loc[by_allgroups.region==region],
+            x='month', y=metric, hue='model', errorbar=('ci', 99),
+            ax=ax, alpha=0.8)
+        #ax.set_axis_off()
+        ax.set_title(region)
+    
+    f.tight_layout()
+    f.savefig(rslt_dir+f'fig_lineplot_monthly_{metric}_{today}.pdf')
+    f.savefig(rslt_dir+f'fig_lineplot_monthly_{metric}_{today}.png', dpi=200)
+    f.show()
+    
+    
+    
+    ax_all = axes_all.ravel()[i]       
+    sns.lineplot(data=by_allgroups,
+        x='month', y=metric, hue='model',
+        errorbar=('ci', 99),
+        ax=ax_all, alpha=0.8)
+    
+    ax_all.set_title(metric)
+
+
+
+f_all.tight_layout()
+f_all.savefig(rslt_dir+f'fig_lineplot_monthly_allregions_allmetrics_{today}.pdf')
+f_all.savefig(rslt_dir+f'fig_lineplot_monthly_allregions_allmetrics_{today}.png', dpi=200)
+f_all.show()
+
+
+
+
+df = by_allgroups.copy()
+
+# Tidy long format for seaborn
+metrics = ["RMSE", "MAE", "Bias", "R", "R2"]
+long = df.melt(
+    id_vars=["model","year","month","region","site"],
+    value_vars=metrics,
+    var_name="metric", value_name="value"
+).dropna(subset=["value"])
+
+# consistent model order (best median RMSE first)
+model_order = (df.groupby("model")["RMSE"].median()
+                 .sort_values(ascending=True).index.tolist())
+
+palette = sns.color_palette(n_colors=len(model_order))
+
+
+
+for metric in metrics:
+    plt.figure(figsize=(8,4))
+    sns.barplot(
+        data=df, x="model", y=metric,
+        order=model_order, estimator=np.median, errorbar=("pi", 50),  # 50% interval ~ IQR
+    )
+    plt.ylabel(metric); plt.xlabel("")
+    plt.title(f"Overall {metric} by model (median ± IQR)")
+    plt.xticks(rotation=0, ha="center")
+    plt.savefig(rslt_dir+f'fig_overall_{metric}_iqr_{today}.pdf')
+    plt.savefig(rslt_dir+f'fig_overall_{metric}_iqr_{today}.png', dpi=200)
+    plt.tight_layout(); plt.show()
+
 
 
 # 2) Frost-event skill at 0 °C (or e.g., -2 °C for severe frost)
 frost_p0 = ats.frost_event_skill(threshold=0.0, groupby=["region","site"])
+frost_p0 = ats.frost_event_skill(threshold=0.0, groupby=["region","site","month","year"])
 frost_m2 = ats.frost_event_skill(threshold=-2.0, groupby="region")
+
+
+sns.set_theme(context="paper", style="whitegrid")
+df = frost_p0.dropna().copy()
+
+g = sns.FacetGrid(df, col="region", col_wrap=3, hue="model", sharex=True, sharey=True, height=3.6, legend_out=True)
+g.map_dataframe(sns.scatterplot, x="Recall", y="Precision", alpha=0.6, s=30)
+g.add_legend(title="Model")
+
+# iso-F1 helper
+def plot_iso_f1(ax, f1_values=(0.2, 0.4, 0.6, 0.8)):
+    r = np.linspace(1e-3, 1.0, 500)
+    for f1 in f1_values:
+        p = (f1 * r) / (2*r - f1)
+        mask = (p >= 0) & (p <= 1)
+        ax.plot(r[mask], p[mask], lw=1, ls="--", color="gray")
+        # label near Recall=0.9 if valid
+        ridx = np.argmin(np.abs(r - 0.9))
+        if mask[ridx]:
+            ax.text(r[ridx], p[ridx], f"F1={f1:.1f}", fontsize=9, color="gray")
+
+for ax in g.axes.flat:
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.set_aspect("equal", adjustable="box")
+    plot_iso_f1(ax)
+
+g.set_titles("{col_name}")
+plt.tight_layout()
+plt.savefig(rslt_dir+f'fig_frost_event_skill_precision_recall{today}.pdf')
+plt.savefig(rslt_dir+f'fig_frost_event_skill_precision_recall{today}.png', dpi=200)
+plt.show()
+
+
+
+plt.figure(figsize=(8, 4.5))
+sns.violinplot(data=df, x="model", y="F1", inner=None, cut=0)
+sns.boxplot(data=df, x="model", y="F1", whis=(5,95), width=0.25, showcaps=False, boxprops={"zorder":2})
+plt.ylim(-0.02, 1.02)
+plt.title("Frost-event F1 distribution by model (all regions)")
+plt.xlabel(""); plt.ylabel("F1")
+plt.xticks(rotation=20, ha="right")
+plt.tight_layout(); plt.show()
+
+# Facet by region
+g = sns.catplot(data=df, x="model", y="F1", col="region", col_wrap=3,
+                kind="violin", inner=None, cut=0, height=3.4)
+for ax in g.axes.flat:
+    ax.set_ylim(-0.02, 1.02)
+    for label in ax.get_xticklabels(): label.set_rotation(20)
+g.set_xlabels(""); g.set_ylabels("F1")
+plt.tight_layout()
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_violinplot_{today}.pdf')
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_violinplot_{today}.png', dpi=200)
+plt.show()
+
+
+
+agg = (df
+       .groupby(["region","model"], as_index=False)
+       .agg(mean_F1=("F1","mean"), n=("F1","size")))
+
+# order by average F1 across regions
+model_order = (agg.groupby("model")["mean_F1"].mean()
+               .sort_values(ascending=False).index.tolist())
+
+pvt = agg.pivot(index="region", columns="model", values="mean_F1")[model_order]
+plt.figure(figsize=(0.9*len(model_order)+4, 5))
+ax = sns.heatmap(pvt, cmap="viridis", annot=True, fmt=".2f", cbar_kws={"label":"Mean F1"})
+ax.set_xlabel("Model"); ax.set_ylabel("Region"); ax.set_title("Mean Frost-event F1")
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_heatmap_{today}.pdf')
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_heatmap_{today}.png', dpi=200)
+plt.tight_layout(); plt.show()
+
+
+
+# optional: show counts in a separate heatmap
+cnt = agg.pivot(index="region", columns="model", values="n")[model_order]
+plt.figure(figsize=(0.9*len(model_order)+4, 5))
+sns.heatmap(cnt, cmap="Greys", annot=True, fmt=".0f", cbar_kws={"label":"Samples"})
+plt.title("Sample counts per Region×Model"); plt.tight_layout(); 
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_heatmap_counts_{today}.pdf')
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_heatmap_counts_{today}.png', dpi=200)
+plt.show()
+
+
+plt.figure(figsize=(7, 4.5))
+sns.ecdfplot(data=df, x="F1", hue="model")
+plt.xlim(0, 1); plt.xlabel("F1"); plt.ylabel("ECDF")
+plt.title("ECDF of F1 by model (lower curve = better overall)")
+plt.tight_layout()
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_ecdf_{today}.pdf')
+plt.savefig(rslt_dir+f'fig_frost_event_skill_F1_ecdf_{today}.png', dpi=200)
+plt.show()
+
+
+
+
 
 # 3) Bioclim indicators for May–Sep, base 0 °C
 #bioclim = ats.bioclim_summary(months=(5,6,7,8,9), base_temp=0.0, frost_thresh=0.0)
@@ -351,7 +1388,7 @@ for indicator in indicators:
                                         f'xgboost_T3_{indicator}_bias', 
                                         f'lasso_T3_{indicator}_bias',
                                         f'microclimf_T3_{indicator}_bias',
-                                        f'E5_skt_degC_{indicator}_bias']]#
+                                        f'E5dyna_skt_degC_{indicator}_bias']]#
         
         data.columns = ['XGBoost','LASSO','Microclimf','ERA5 SKT']
         #data.columns = ['Observed','XGBoost','LASSO','Microclimf','ERA5 SKT']
@@ -371,7 +1408,7 @@ vg_lass = ats.semivariogram(model="lasso_T3", max_range_m=10_000, n_bins=50, n_h
 vg_mclf = ats.semivariogram(model="microclimf_T3", max_range_m=10_000, n_bins=50, n_hours=10000,
                        n_pairs_per_hour=5000, seed=42, by_region=False)
                        
-vg_era5 = ats.semivariogram(model="E5_skt_degC", max_range_m=10_000, n_bins=50, n_hours=10000,
+vg_era5 = ats.semivariogram(model="E5dyna_skt_degC", max_range_m=10_000, n_bins=50, n_hours=10000,
                        n_pairs_per_hour=5000, seed=42, by_region=False)
 
 
@@ -450,7 +1487,7 @@ plt.show()
 
 
 
-
+'''
 for region in regions: #["KIL","VAR"]:
     plt.plot(vg_xgbs.loc[vg_xgbs.region==region,'h_center_m'], vg_xgbs.loc[vg_xgbs.region==region,'semivariance'],c='b')
 
@@ -463,7 +1500,7 @@ for region in regions: #["KIL","VAR"]:
     plt.plot(vg_obs_for_xgbs.loc[vg_obs_for_xgbs.region==region,'h_center_m'], vg_obs_for_xgbs.loc[vg_obs_for_xgbs.region==region,'semivariance'],c='k',ls='--')
     
     plt.show()
-
+'''
 
 
 """
@@ -474,7 +1511,7 @@ from sklearn.cluster import KMeans
 cluster_results = []
 for region in regions:
     df_region = Y[Y['region'] == region].copy()
-    features = ['T3', 'predicted_T3', 'E5_skt_degC']
+    features = ['T3', 'predicted_T3', 'E5dyna_skt_degC']
     df_features = df_region[features].dropna()
 
     if len(df_features) < 100:
@@ -652,7 +1689,8 @@ for region in regions:
     # ----------------------------------------------------------------
     y_tmean = (
         y[['time','T1','T2','T3','T1_offset','T2_offset','T3_offset',
-           'E5_t2m_degC','E5_skt_degC',
+           #'E5dyna_t2m_degC',
+           'E5dyna_skt_degC',
            'xgboost_T1_offset','xgboost_T2_offset','xgboost_T3_offset',
            'xgboost_T1','xgboost_T2','xgboost_T3',
            'lasso_T1_offset','lasso_T2_offset','lasso_T3_offset',
@@ -664,7 +1702,8 @@ for region in regions:
 
     y_smean = (
         y[['lat','lon','T1','T2','T3','T1_offset','T2_offset','T3_offset',
-           'E5_t2m_degC','E5_skt_degC',
+           #'E5dyna_t2m_degC',
+           'E5dyna_skt_degC',
            'xgboost_T1_offset','xgboost_T2_offset','xgboost_T3_offset',
            'xgboost_T1','xgboost_T2','xgboost_T3',
            'lasso_T1_offset','lasso_T2_offset','lasso_T3_offset',
@@ -678,17 +1717,17 @@ for region in regions:
     # ----------------------------------------------------------------
     # Compute error arrays
     # ----------------------------------------------------------------
-    err_era_all = y['E5_skt_degC'] - y['T3']
+    err_era_all = y['E5dyna_skt_degC'] - y['T3']
     err_xgb_all = y['xgboost_T3'] - y['T3']
     err_lss_all = y['xgboost_T3'] - y['T3']
     err_rfr_all = y['microclimf_T3'] - y['T3']
 
-    err_era_time = y_tmean['E5_skt_degC'] - y_tmean['T3']
+    err_era_time = y_tmean['E5dyna_skt_degC'] - y_tmean['T3']
     err_xgb_time = y_tmean['xgboost_T3'] - y_tmean['T3']
     err_lss_time = y_tmean['lasso_T3'] - y_tmean['T3']
     err_rfr_time = y_tmean['microclimf_T3'] - y_tmean['T3']
 
-    err_era_site = y_smean['E5_skt_degC'] - y_smean['T3']
+    err_era_site = y_smean['E5dyna_skt_degC'] - y_smean['T3']
     err_xgb_site = y_smean['xgboost_T3'] - y_smean['T3']
     err_lss_site = y_smean['lasso_T3'] - y_smean['T3']
     err_rfr_site = y_smean['microclimf_T3'] - y_smean['T3']
@@ -699,7 +1738,7 @@ for region in regions:
     plot_data = [
         {
             "obs":     y["T3"].values.ravel(),
-            "era":     y["E5_skt_degC"].values.ravel(),
+            "era":     y["E5dyna_skt_degC"].values.ravel(),
             "xgb":     y["xgboost_T3"].values.ravel(),
             "lss":     y["lasso_T3"].values.ravel(),
             "rfr":     y["microclimf_T3"].values.ravel(),
@@ -713,7 +1752,7 @@ for region in regions:
         },
         {
             "obs":     y_tmean["T3"],
-            "era":     y_tmean["E5_skt_degC"],
+            "era":     y_tmean["E5dyna_skt_degC"],
             "xgb":     y_tmean["xgboost_T3"],
             "lss":     y_tmean["lasso_T3"],
             "rfr":     y_tmean["microclimf_T3"],
@@ -727,7 +1766,7 @@ for region in regions:
         },
         {
             "obs":     y_smean["T3"],
-            "era":     y_smean["E5_skt_degC"],
+            "era":     y_smean["E5dyna_skt_degC"],
             "xgb":     y_smean["xgboost_T3"],
             "lss":     y_smean["lasso_T3"],
             "rfr":     y_smean["microclimf_T3"],
@@ -825,8 +1864,8 @@ for region in regions:
     y['month'] = y['time'].dt.month
 
     # Create error columns if not already present.
-    y['err_era'] = y['E5_skt_degC'] - y['T3']
-    y['err_xgb'] = y['predicted_T3'] - y['T3']
+    y['err_era'] = y['E5dyna_skt_degC'] - y['T3']
+    y['err_xgb'] = y['xgboost_T3'] - y['T3']
 
     # Compute the mean error per month per site (for boxplots).
     monthly_err_df = y.groupby(['month', 'site']).agg({
@@ -876,8 +1915,8 @@ for region in regions:
     # For performance metrics, we aggregate the data by month and site using the mean of T3, ERA5, and XGBoost.
     monthly_df = y.groupby(['month', 'site']).agg({
         'T3': 'mean',
-        'E5_skt_degC': 'mean',
-        'predicted_T3': 'mean'
+        'E5dyna_skt_degC': 'mean',
+        'xgboost_T3': 'mean'
     }).reset_index()
 
     # Loop over months and compute for each method:
@@ -890,18 +1929,18 @@ for region in regions:
         dfm = monthly_df[monthly_df['month'] == m]
         
         # ERA5 metrics:
-        diff_era = dfm['E5_skt_degC'] - dfm['T3']
+        diff_era = dfm['E5dyna_skt_degC'] - dfm['T3']
         mean_error_era = diff_era.mean()
         mae_era = np.abs(diff_era).mean()
         rmse_era = np.sqrt(np.mean(diff_era**2))
-        corr_era = pearsonr(dfm['T3'], dfm['E5_skt_degC'])[0]
+        corr_era = pearsonr(dfm['T3'], dfm['E5dyna_skt_degC'])[0]
         
         # XGBoost metrics:
-        diff_xgb = dfm['predicted_T3'] - dfm['T3']
+        diff_xgb = dfm['xgboost_T3'] - dfm['T3']
         mean_error_xgb = diff_xgb.mean()
         mae_xgb = np.abs(diff_xgb).mean()
         rmse_xgb = np.sqrt(np.mean(diff_xgb**2))
-        corr_xgb = pearsonr(dfm['T3'], dfm['predicted_T3'])[0]
+        corr_xgb = pearsonr(dfm['T3'], dfm['xgboost_T3'])[0]
         
         monthly_metrics.append({
             'month': m,
@@ -1216,7 +2255,7 @@ VAR ERA5 rmse: 4.635915064734512
 """
 
 # Read microclimf simulations for reference
-ds_microclimf = fcts.read_microclimf(fs, inpt_dir, vrbs, all_yrs, site_points.values)
+ds_microclimf = fcts.read_microclimf(fs, inpt_dir_microclimf, vrbs, all_yrs, site_points.values)
 fcts.print_ram_state()
 
 for v in vrbs:
@@ -1282,7 +2321,7 @@ for rgn in areas:
             try: to_plot['Microclimf '+vrb+' all']    = y[[vrb,'microclimf_'+vrb]]
             except: to_plot['Microclimf '+vrb+' all']    = None
             
-            to_plot['ERA5 '+vrb+' all']    = y[[vrb,'E5_skt_degC']]
+            to_plot['ERA5 '+vrb+' all']    = y[[vrb,'E5dyna_skt_degC']]
             to_plot['Offset of XGBoost '+vrb+' all'] = y[[vrb+'_offset', 'xgboost_'+vrb+'_offset']]
             to_plot['Offset of Lasso '+vrb+' all'] = y[[vrb+'_offset', 'lasso_'+vrb+'_offset']]
         else:
@@ -1292,7 +2331,7 @@ for rgn in areas:
             try: to_plot['Microclimf '+vrb+' '+rgn]    = y.loc[y['region']==rgn,[vrb,'microclimf_'+vrb]]
             except: to_plot['Microclimf '+vrb+' '+rgn] = None
             
-            to_plot['ERA5 '+vrb+' '+rgn]    = y.loc[y['region']==rgn,[vrb,'E5_skt_degC']]
+            to_plot['ERA5 '+vrb+' '+rgn]    = y.loc[y['region']==rgn,[vrb,'E5dyna_skt_degC']]
             to_plot['Offset of XGBoost '+vrb+' '+rgn] = y.loc[y['region']==rgn,[vrb+'_offset', 'xgboost_'+vrb+'_offset']]
             to_plot['Offset of Lasso '+vrb+' '+rgn] = y.loc[y['region']==rgn,[vrb+'_offset', 'lasso_'+vrb+'_offset']]
         
@@ -1318,10 +2357,10 @@ for rgn in areas:
             
             vmin, vmax = np.nanmin(np.ravel(pl)) - 0.5, np.nanmax(np.ravel(pl)) + 0.5
             bin_edges = np.linspace(vmin, vmax, 50)
-            ax.hist2d(x_, y_, bins=bin_edges, cmap='YlGnBu', norm=LogNorm(1))
+            ax.hist2d(x_, y_, bins=bin_edges, cmap='pink_r', norm=SymLogNorm(1)) # cmap='YlGnBu',
             
             print(vmin,vmax,corr,rmse,r2ss,)
-            print(x_,y_)
+            #print(x_,y_)
             
             # Add 1:1 line and axes
             ax.plot([vmin, vmax], [vmin, vmax], color='b', linestyle="--")
@@ -1373,7 +2412,7 @@ metrics    = {  'RMS': fcts.calc_rmse,
                 'COR': fcts.calc_corr,
                 }
 
-approaches = {  'E5_skt_degC': 'ERA5 raw', 
+approaches = {  'E5dyna_skt_degC': 'ERA5 raw', 
                 'xgboost_T3': 'XGBoost',
                 'lasso_T3': 'LASSO',
                 'microclimf_T3': 'Microclimf',
@@ -1488,13 +2527,13 @@ metrics    = {  'RMS': fcts.calc_rmse,
 approaches = {  'xgboost_T3': 'XGBoost',
                 'lasso_T3': 'LASSO',
                 'microclimf_T3': 'Microclimf',
-                'E5_skt_degC': 'ERA5 skt', 
+                'E5dyna_skt_degC': 'ERA5 skt', 
                 }
 
 colors  =    {  'xgboost_T3': 'tab:orange',
                 'lasso_T3': 'tab:green',
                 'microclimf_T3': 'tab:cyan',
-                'E5_skt_degC': 'tab:red', 
+                'E5dyna_skt_degC': 'tab:red', 
                 }
 
 
@@ -1505,7 +2544,8 @@ colors  =    {  'xgboost_T3': 'tab:orange',
 
 
 sns.set_theme(style="darkgrid")
-f, axes = plt.subplots(6,3, figsize=(14,10))#, sharex=True, sharey=True)
+#f, axes = plt.subplots(6,3, figsize=(14,10))#, sharex=True, sharey=True)
+f, axes = plt.subplots(6,2, figsize=(8,10))#, sharex=True, sharey=True)
 
 
 #for ax, metric_name in zip(axes.ravel(), metrics.keys()):
@@ -1521,7 +2561,7 @@ for i,region in enumerate(regions):
 
     for j,metric_name in enumerate(metrics.keys()):
         
-        ax = axes.ravel()[k]
+        ax = axes[i,j] #axes.ravel()[k]
         print(region, metric_name)
         for approach_name in approaches.keys():
             name = approaches[approach_name]
@@ -1554,7 +2594,7 @@ plt.show(); plt.clf(); plt.close('all')
 
 # THIS analysis
 sns.set_theme(style="whitegrid")
-f, axes = plt.subplots(2,2, figsize=(8,8))#, sharex=True, sharey=True)
+f, axes = plt.subplots(2,2, figsize=(7,7))#, sharex=True, sharey=True)
 
 k = 0
 for grp_name, mth_grouping in zip(['Year-round','Summer'], [range(1,13), range(5,10)]):
@@ -1591,7 +2631,7 @@ for grp_name, mth_grouping in zip(['Year-round','Summer'], [range(1,13), range(5
         
         k+=1
 
-plt.suptitle('Density of hourly regression metrics, mean over KIL and VAR regions')
+plt.suptitle('Density of hourly validation metrics\nMean over KIL and VAR regions')
 
 plt.tight_layout(); 
 f.savefig(rslt_dir+f'fig_kdeplot_HOURLY_KILVAR_TOMS_{today}.pdf')
@@ -1618,9 +2658,9 @@ for obs_key in ['T1','T2','T3']:
 
     temp_level = temp_levels[obs_key]
 
-    val_cols = [obs_key, f"xgboost_{obs_key}", f"lasso_{obs_key}", "microclimf_T3", "E5_skt_degC"]
+    val_cols = [obs_key, f"xgboost_{obs_key}", f"lasso_{obs_key}", "microclimf_T3", "E5dyna_skt_degC"]
     regional_temp_range = fcts.regional_daily_temp_range_climatology(Y,
-        #value_cols=["T3", "xgboost_T3", "lasso_T3", "microclimf_T3", "E5_skt_degC"],
+        #value_cols=["T3", "xgboost_T3", "lasso_T3", "microclimf_T3", "E5dyna_skt_degC"],
         value_cols=val_cols,
         time_col="time",drop_feb29=True)
 
@@ -1669,15 +2709,15 @@ for obs_key in ['T1','T2','T3']:
 
 
 regional_meanminmax = fcts.regional_daily_meanminmax_climatology(Y,
-    value_cols=["T3", "xgboost_T3", "lasso_T3", "microclimf_T3", "E5_skt_degC"],
+    value_cols=["T3", "xgboost_T3", "lasso_T3", "microclimf_T3", "E5dyna_skt_degC"],
     time_col="time",drop_feb29=True)
 
 
 
 #f, axes = plt.subplots(2,3, figsize=(10,8))
 f, axes = plt.subplots(1,2, figsize=(8,5))
-colors = {"xgboost_T3":'tab:orange', "lasso_T3":'tab:green', "microclimf_T3":'tab:cyan', "E5_skt_degC":'tab:red'}
-for i,model in enumerate(["xgboost_T3", "lasso_T3", "microclimf_T3",]): # "E5_skt_degC"]):
+colors = {"xgboost_T3":'tab:orange', "lasso_T3":'tab:green', "microclimf_T3":'tab:cyan', "E5dyna_skt_degC":'tab:red'}
+for i,model in enumerate(["xgboost_T3", "lasso_T3", "microclimf_T3",]): # "E5dyna_skt_degC"]):
 #for i,model in enumerate(["xgboost_T3", "microclimf_T3"]):
     
     #for ax,region in zip(axes.ravel(), regions):
